@@ -45,3 +45,5 @@ vitis*.log
 
 # Streamlit
 .streamlit/secrets.toml
+
+.env
