@@ -15,13 +15,15 @@ which one ran.
 from __future__ import annotations
 
 from contextlib import nullcontext
+import os
 from pathlib import Path
 from typing import Any, Callable
 
 from glm.agent import GLMGenerator
 from glm.finetune import lora as lora_mod
 from glm.finetune.dataset import to_preference_pairs, to_repair_preference_pairs, to_sft_examples
-from glm.serving import HFBackend
+from glm.finetune.grpo import grpo_policy_loss, to_grpo_group
+from glm.serving import HFBackend, _input_device
 from glm.tasks import FpgaTask
 from paths import REPO_ROOT, get_logger
 
@@ -40,9 +42,12 @@ class TestTimeTrainer:
         lr: float = 1e-4,
         steps_per_round: int = 4,
         max_seq_len: int = 1024,
-        use_dpo: bool = True,
+        use_dpo: bool = False,
+        use_grpo: bool | None = None,
+        use_sft: bool | None = None,
         dpo_weight: float = 0.5,
         dpo_beta: float = 0.1,
+        grpo_min_group: int = 2,
         anchor_regression_threshold: float = -50.0,
         run_name: str = "glm_ttt",
         evaluate_fn: Callable[[Any], dict[str, Any]] | None = None,
@@ -52,7 +57,28 @@ class TestTimeTrainer:
         self.lr = lr
         self.steps_per_round = steps_per_round
         self.max_seq_len = max_seq_len
+        if use_grpo is None:
+            use_grpo = os.environ.get("BURN_TTT_USE_GRPO", "").strip().lower() in ("1", "true", "yes")
+        if use_sft is None:
+            use_sft = not use_grpo and os.environ.get("BURN_TTT_USE_SFT", "1").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+        if use_grpo:
+            use_dpo = False
+        elif os.environ.get("BURN_TTT_USE_DPO", "").strip().lower() in ("1", "true", "yes"):
+            use_dpo = True
+        self.use_grpo = use_grpo
+        self.use_sft = use_sft
         self.use_dpo = use_dpo
+        self.grpo_min_group = grpo_min_group
+        env_steps = os.environ.get("BURN_TTT_STEPS_PER_ROUND", "").strip()
+        if env_steps:
+            self.steps_per_round = int(env_steps)
+        env_lr = os.environ.get("BURN_TTT_LR", "").strip()
+        if env_lr:
+            self.lr = float(env_lr)
         self.dpo_weight = dpo_weight
         self.dpo_beta = dpo_beta
         self.anchor_regression_threshold = anchor_regression_threshold
@@ -65,9 +91,12 @@ class TestTimeTrainer:
         self.anchor_reward: float | None = None
         self.is_real = isinstance(generator.backend, HFBackend) and lora_mod.peft_available()
         logger.info(
-            "TestTimeTrainer mode: %s (backend=%s)",
+            "TestTimeTrainer mode: %s (backend=%s, sft=%s dpo=%s grpo=%s)",
             "REAL LoRA" if self.is_real else "heuristic adapt",
             generator.backend.name,
+            self.use_sft,
+            self.use_dpo,
+            self.use_grpo,
         )
 
     def set_anchor(self, config: dict[str, Any], reward: float) -> None:
@@ -99,9 +128,18 @@ class TestTimeTrainer:
             return
 
         backend: HFBackend = self.generator.backend  # type: ignore[assignment]
-        adapted = lora_mod.apply_lora(backend.model)
+        use_unsloth = getattr(backend, "use_unsloth", False)
+        adapted = lora_mod.apply_lora(backend.model, use_unsloth=use_unsloth)
         backend.attach_adapter(adapted)
-        adapted.train()
+        if use_unsloth:
+            try:
+                from unsloth import FastLanguageModel
+
+                FastLanguageModel.for_training(adapted)
+            except Exception:  # noqa: BLE001
+                adapted.train()
+        else:
+            adapted.train()
         params = [p for p in adapted.parameters() if p.requires_grad]
         self._optimizer = __import__("torch").optim.AdamW(params, lr=self.lr)
         self._lora_ready = True
@@ -127,6 +165,9 @@ class TestTimeTrainer:
         return delta
 
     def _lora_step(self, rows: list[dict[str, Any]], round_idx: int) -> dict[str, Any]:
+        if self.use_grpo:
+            return self._grpo_step(rows, round_idx)
+
         examples = to_sft_examples(self.task, rows)
         pref_pairs = to_preference_pairs(self.task, rows)
         pref_pairs.extend(to_repair_preference_pairs(self.task, rows))
@@ -138,7 +179,7 @@ class TestTimeTrainer:
         backend: HFBackend = self.generator.backend  # type: ignore[assignment]
         tok = backend.tokenizer
         model = backend.model
-        device = next(model.parameters()).device
+        device = _input_device(model)
 
         sft_losses: list[float] = []
         dpo_losses: list[float] = []
@@ -201,12 +242,61 @@ class TestTimeTrainer:
         logger.info("LoRA step: %s", info)
         return info
 
+    def _grpo_step(self, rows: list[dict[str, Any]], round_idx: int) -> dict[str, Any]:
+        group = to_grpo_group(self.task, rows, round_idx, min_group=self.grpo_min_group)
+        if not group:
+            return {"adapted": False, "reason": f"grpo group too small for round {round_idx}"}
+
+        self._ensure_lora()
+        backend: HFBackend = self.generator.backend  # type: ignore[assignment]
+        tok = backend.tokenizer
+        model = backend.model
+        device = _input_device(model)
+        apply_tpl = getattr(backend, "_apply_chat_template", None)
+
+        grpo_losses: list[float] = []
+        stats: dict[str, float] = {}
+        for _ in range(self.steps_per_round):
+            self._optimizer.zero_grad()
+            loss, stats = grpo_policy_loss(
+                model,
+                tok,
+                group,
+                device,
+                self.max_seq_len,
+                apply_chat_template=apply_tpl,
+            )
+            loss.backward()
+            self._optimizer.step()
+            grpo_losses.append(stats["grpo_loss"])
+
+        anchor_delta = self._check_anchor()
+        info: dict[str, Any] = {
+            "adapted": True,
+            "n_grpo": len(group),
+            "round": round_idx,
+            "grpo_loss_first": grpo_losses[0],
+            "grpo_loss_last": grpo_losses[-1],
+            **{k: v for k, v in stats.items() if k != "grpo_loss"},
+        }
+        if anchor_delta is not None:
+            info["anchor_reward_delta"] = anchor_delta
+        logger.info("GRPO step: %s", info)
+        return info
+
     def _nll(self, model, tok, system, prompt, completion, device):
-        prompt_text = tok.apply_chat_template(
-            [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        backend = getattr(self.generator, "backend", None)
+        apply_tpl = getattr(backend, "_apply_chat_template", None)
+        if apply_tpl is not None:
+            prompt_text = apply_tpl(
+                [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+            )
+        else:
+            prompt_text = tok.apply_chat_template(
+                [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         eos = tok.eos_token or ""
         full_ids = tok(
             prompt_text + completion + eos,
@@ -220,11 +310,18 @@ class TestTimeTrainer:
         return model(input_ids=full_ids, labels=labels).loss
 
     def _encode(self, tok, ex, device):
-        prompt_text = tok.apply_chat_template(
-            [{"role": "system", "content": ex.system}, {"role": "user", "content": ex.prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        backend = getattr(self.generator, "backend", None)
+        apply_tpl = getattr(backend, "_apply_chat_template", None)
+        if apply_tpl is not None:
+            prompt_text = apply_tpl(
+                [{"role": "system", "content": ex.system}, {"role": "user", "content": ex.prompt}]
+            )
+        else:
+            prompt_text = tok.apply_chat_template(
+                [{"role": "system", "content": ex.system}, {"role": "user", "content": ex.prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         prompt_ids = tok(prompt_text, return_tensors="pt").input_ids[0]
         full_ids = tok(prompt_text + ex.completion + tok.eos_token, return_tensors="pt").input_ids[0]
         full_ids = full_ids[: self.max_seq_len]

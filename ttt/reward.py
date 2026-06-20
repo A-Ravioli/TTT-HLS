@@ -18,7 +18,10 @@ BOARD_BUDGETS: dict[str, dict[str, int]] = {
     # Kria KV260 / ZU7EV-class (Zynq UltraScale+).
     "xczu7ev-ffvc1156-2-e": {"dsp": 1728, "lut": 230400, "ff": 460800, "bram": 312},
     # Alveo U250 (large datacenter FPGA) -- where a Qwen block can realistically land.
+    # Alveo U250 (large datacenter FPGA).
     "xcu250-figd2104-2l-e": {"dsp": 12288, "lut": 1728000, "ff": 3456000, "bram": 2688},
+    # AWS EC2 F2 — AMD Virtex UltraScale+ HBM VU47P.
+    "xcvu47p-fsvh2892-2-e": {"dsp": 9024, "lut": 1303680, "ff": 2607360, "bram": 2016},
 }
 
 DEFAULT_PART = "xc7z020clg400-1"

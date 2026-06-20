@@ -47,3 +47,4 @@ vitis*.log
 .streamlit/secrets.toml
 
 .env
+.env.pod

@@ -4,7 +4,7 @@ import random
 
 from glm.agent import GLMGenerator
 from glm.parsing import dict_to_config, parse_configs
-from glm.serving import HeuristicBackend, _norm_vector, _dist2, load_backend
+from glm.serving import HeuristicBackend, _norm_vector, _dist2, load_backend, normalize_hf_model_id
 from glm.tasks import make_task, tiny_ffn_block
 from glm.trajectories import TrajectoryStore
 from ttt.config_space import BurnConfig
@@ -97,6 +97,11 @@ def test_load_backend_defaults_to_heuristic(monkeypatch):
     monkeypatch.delenv("BURN_GLM_MODEL", raising=False)
     monkeypatch.delenv("BURN_GLM_BACKEND", raising=False)
     assert load_backend().name == "heuristic"
+
+
+def test_normalize_hf_model_id_maps_legacy_chatglm():
+    assert normalize_hf_model_id("THUDM/glm-4-9b-chat") == "THUDM/glm-4-9b-chat-hf"
+    assert normalize_hf_model_id("THUDM/glm-4-9b-chat-hf") == "THUDM/glm-4-9b-chat-hf"
 
 
 # -- trajectory store -------------------------------------------------------

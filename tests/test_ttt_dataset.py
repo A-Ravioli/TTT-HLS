@@ -7,6 +7,7 @@ from glm.finetune.dataset import (
     to_repair_preference_pairs,
     to_sft_examples,
 )
+from glm.finetune.grpo import group_advantages, to_grpo_group
 from glm.finetune.dataset_hls import to_hls_preference_pairs, to_hls_sft_examples
 from glm.tasks import make_task, tiny_ffn_block
 from ttt.reward import get_board_budget
@@ -109,3 +110,21 @@ def test_hls_dpo_both_pass_cosim():
     ]
     pairs = to_hls_preference_pairs(task, rows)
     assert len(pairs) == 1
+
+
+def test_grpo_group_advantages():
+    adv = group_advantages([1.0, 3.0, 5.0])
+    assert len(adv) == 3
+    assert adv[1] == 0.0 or abs(adv[1]) < abs(adv[2])
+
+
+def test_grpo_group_from_round():
+    task = _task()
+    rows = [
+        {**_cfg_row(10.0), "round": 2},
+        {**_cfg_row(50.0), "round": 2},
+        {**_cfg_row(5.0), "round": 1},
+    ]
+    group = to_grpo_group(task, rows, round_idx=2)
+    assert len(group) == 2
+    assert group[1].advantage > group[0].advantage

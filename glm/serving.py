@@ -24,6 +24,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from paths import get_logger
+from glm.model_specs import pod_spec_for_model
 from ttt.config_space import (
     BITWIDTHS,
     REUSE_FACTORS,
@@ -33,6 +34,68 @@ from ttt.config_space import (
 )
 
 logger = get_logger("burnttt.glm.serving")
+
+# Legacy repos use custom ChatGLM code that breaks on transformers>=5 (max_length vs seq_length).
+# The -hf checkpoints use native GlmForCausalLM (transformers>=4.46).
+LEGACY_GLM_HF_ALIASES: dict[str, str] = {
+    "THUDM/glm-4-9b-chat": "THUDM/glm-4-9b-chat-hf",
+    "THUDM/glm-4-9b": "THUDM/glm-4-9b-hf",
+    "zai-org/glm-4-9b-chat": "zai-org/glm-4-9b-chat-hf",
+    "zai-org/glm-4-9b": "zai-org/glm-4-9b-hf",
+}
+
+# Prime Inference API models (OpenAI-compatible; no local LoRA).
+PRIME_GLM_MODELS = (
+    "z-ai/glm-5.2",
+    "z-ai/glm-5.1",
+    "z-ai/glm-5",
+    "z-ai/glm-4.7-flash",
+    "z-ai/glm-4.7",
+    "z-ai/glm-4.6",
+    "z-ai/glm-4.5-air",
+    "z-ai/glm-4.5",
+    "zai-org/GLM-4.7",
+)
+
+
+def normalize_hf_model_id(model_id: str) -> str:
+    """Map legacy ChatGLM repo ids to transformers-native -hf weights."""
+    mid = model_id.strip()
+    mapped = LEGACY_GLM_HF_ALIASES.get(mid, mid)
+    if mapped != mid:
+        logger.warning(
+            "Remapping legacy GLM checkpoint %r -> %r (required for transformers>=4.46; "
+            "old custom ChatGLM code fails on transformers 5.x).",
+            mid,
+            mapped,
+        )
+    return mapped
+
+
+def _is_glm_moe(model_id: str) -> bool:
+    mid = model_id.lower()
+    return "glm-5" in mid or "glm_5" in mid or "glm-4.7" in mid or "moe" in mid
+
+
+def _input_device(model: Any) -> Any:
+    """Device for token inputs (works with device_map / Unsloth sharding)."""
+    if hasattr(model, "device") and model.device is not None and str(model.device) != "meta":
+        return model.device
+    try:
+        return model.get_input_embeddings().weight.device
+    except Exception:  # noqa: BLE001
+        import torch
+
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def unsloth_available() -> bool:
+    try:
+        import unsloth  # noqa: F401
+
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class GLMBackend(ABC):
@@ -225,30 +288,62 @@ class HFBackend(GLMBackend):
     is_llm = True
 
     def __init__(self, model_id: str, max_new_tokens: int = 512, temperature: float = 0.7, device: str | None = None):
-        self.model_id = model_id
+        self.model_id = normalize_hf_model_id(model_id)
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.device = device
         self._model = None
         self._tokenizer = None
+        spec = pod_spec_for_model(self.model_id)
+        self.use_unsloth = spec.use_unsloth and unsloth_available()
+        self._pod_spec = spec
 
     # -- lazy load ---------------------------------------------------------
     def _ensure_loaded(self) -> None:
         if self._model is not None:
             return
+
+        spec = self._pod_spec
+        if spec.use_unsloth and not unsloth_available():
+            logger.warning(
+                "Model %s expects Unsloth (MoE); falling back to transformers load — may OOM.",
+                self.model_id,
+            )
+
+        if self.use_unsloth:
+            self._load_unsloth()
+            return
+
         import torch  # noqa: F401
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         logger.info("Loading GLM weights: %s", self.model_id)
-        self._tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True)
-        self._model = AutoModelForCausalLM.from_pretrained(
-            self.model_id,
-            trust_remote_code=True,
-            torch_dtype="auto",
-            device_map="auto" if self.device is None else None,
-        )
+        trust_remote = not self.model_id.endswith("-hf")
+        multi_gpu = _is_glm_moe(self.model_id) or spec.gpu_count > 1
+        self._tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=trust_remote)
+        load_kwargs: dict[str, Any] = {
+            "trust_remote_code": trust_remote,
+            "torch_dtype": "auto",
+        }
+        if self.device is None and multi_gpu:
+            load_kwargs["device_map"] = "auto"
+        self._model = AutoModelForCausalLM.from_pretrained(self.model_id, **load_kwargs)
         if self.device is not None:
             self._model = self._model.to(self.device)
+
+    def _load_unsloth(self) -> None:
+        from unsloth import FastLanguageModel
+
+        max_seq = int(os.environ.get("BURN_GLM_MAX_SEQ_LEN", "2048"))
+        logger.info("Loading GLM via Unsloth: %s (max_seq=%d, device_map=balanced)", self.model_id, max_seq)
+        self._model, self._tokenizer = FastLanguageModel.from_pretrained(
+            self.model_id,
+            max_seq_length=max_seq,
+            dtype=None,
+            load_in_4bit=False,
+            device_map="balanced",
+        )
+        FastLanguageModel.for_inference(self._model)
 
     @property
     def model(self):
@@ -264,16 +359,31 @@ class HFBackend(GLMBackend):
         """Swap in a LoRA-adapted model (used by the test-time trainer)."""
         self._model = adapter
 
-    # -- generation --------------------------------------------------------
-    def _generate(self, system: str, user: str, n: int) -> list[str]:
-        import torch
+    def _chat_template_kwargs(self) -> dict[str, Any]:
+        if _is_glm_moe(self.model_id):
+            return {"enable_thinking": False}
+        return {}
 
-        self._ensure_loaded()
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        prompt = self._tokenizer.apply_chat_template(
+    def _apply_chat_template(self, messages: list[dict[str, str]]) -> str:
+        kwargs = self._chat_template_kwargs()
+        if kwargs:
+            return self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                chat_template_kwargs=kwargs,
+            )
+        return self._tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
+
+    # -- generation --------------------------------------------------------
+    def _generate(self, system: str, user: str, n: int) -> list[str]:
+        self._ensure_loaded()
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        prompt = self._apply_chat_template(messages)
+        dev = _input_device(self._model)
+        inputs = self._tokenizer(prompt, return_tensors="pt").to(dev)
         outs = self._model.generate(
             **inputs,
             do_sample=True,

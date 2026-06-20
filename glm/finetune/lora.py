@@ -60,8 +60,39 @@ def default_lora_config(
     )
 
 
-def apply_lora(model: Any, config: Any | None = None) -> Any:
+def apply_lora(model: Any, config: Any | None = None, use_unsloth: bool = False) -> Any:
     """Return ``model`` wrapped with LoRA adapters (only the adapters train)."""
+    if use_unsloth:
+        from unsloth import FastLanguageModel
+
+        cfg = config
+        r = getattr(cfg, "r", 16) if cfg is not None else 16
+        alpha = getattr(cfg, "lora_alpha", 32) if cfg is not None else 32
+        dropout = getattr(cfg, "lora_dropout", 0.05) if cfg is not None else 0.05
+        peft_model = FastLanguageModel.get_peft_model(
+            model,
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+                "gate_up_proj",
+            ],
+            use_gradient_checkpointing="unsloth",
+            random_state=3407,
+        )
+        try:
+            peft_model.print_trainable_parameters()
+        except Exception:  # noqa: BLE001
+            pass
+        return peft_model
+
     from peft import get_peft_model
 
     config = config or default_lora_config()

@@ -313,7 +313,7 @@ def run_glm_ttt_search(
         generator,
         task,
         evaluate_fn=ctx.evaluate,
-        run_name="glm_ttt",
+        run_name=os.environ.get("BURN_TTT_RUN_NAME", "glm_ttt"),
     )
     return _glm_loop(generator, task, rounds, candidates_per_round, "glm_ttt", ctx, trainer=trainer, store=store)
 
