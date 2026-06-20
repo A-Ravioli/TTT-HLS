@@ -6,6 +6,7 @@ dashboard can compare them on equal evaluation budgets.
 
 from __future__ import annotations
 
+import os
 import random
 from datetime import datetime
 from pathlib import Path
