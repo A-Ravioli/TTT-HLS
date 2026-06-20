@@ -213,19 +213,37 @@ def _glm_loop(
     """
     from glm.agent import result_to_history_row
 
+    try:
+        from infra import wandb_run
+    except ImportError:
+        wandb_run = None  # type: ignore[assignment]
+
     history: list[dict[str, Any]] = []
     tried: set[str] = set()
     rows: list[dict[str, Any]] = []
     attempt = 0
 
-    def _consume(cfg: BurnConfig, round_idx: int) -> dict[str, Any]:
+    def _consume(cfg: BurnConfig, round_idx: int, is_repair: bool = False) -> dict[str, Any]:
         nonlocal attempt
         result = ctx.evaluate(cfg)
-        history.append(result_to_history_row(result))
+        hist_row = result_to_history_row(result)
+        hist_row["round"] = round_idx
+        if is_repair:
+            hist_row["is_repair"] = True
+        history.append(hist_row)
         tried.add(cfg.short_name())
-        rows.append(_record(result, method, attempt=attempt, round_idx=round_idx))
+        row = _record(result, method, attempt=attempt, round_idx=round_idx)
+        rows.append(row)
         if store is not None:
             store.append(task.name, cfg.to_dict(), result, method=method, round_idx=round_idx)
+        if wandb_run and wandb_run.wandb_available():
+            wandb_run.log_eval(attempt, method, result, round_idx=round_idx)
+        # Anchor: first passing config within accuracy budget.
+        if trainer is not None and result.get("compile_success"):
+            max_err = result.get("max_error")
+            ok = max_err is None or float(max_err) <= task.max_error_threshold
+            if ok and trainer.anchor_config is None:
+                trainer.set_anchor(cfg.to_dict(), float(result.get("reward", 0)))
         attempt += 1
         logger.info("[%s r%d] %s reward=%.1f", method, round_idx, cfg.short_name(), result["reward"])
         return result
@@ -242,15 +260,19 @@ def _glm_loop(
         proposals = generator.propose(task, history, n=candidates_per_round, exclude=tried)
         for cfg in proposals:
             result = _consume(cfg, r)
-            # Repair loop: one shot at fixing a config that failed to compile.
             if not result.get("compile_success"):
                 fixed = generator.repair(task, cfg, result.get("error_msg", ""))
                 if fixed is not None and fixed.short_name() not in tried:
                     logger.info("[%s r%d] repairing %s -> %s", method, r, cfg.short_name(), fixed.short_name())
-                    _consume(fixed, r)
+                    _consume(fixed, r, is_repair=True)
         if trainer is not None:
-            info = trainer.step(history)
+            info = trainer.step(history, round_idx=r)
+            if wandb_run and wandb_run.wandb_available():
+                wandb_run.log_ttt_step(attempt, info)
             logger.info("[%s] test-time train after round %d: %s", method, r, info)
+
+    if trainer is not None and hasattr(trainer, "save_adapter"):
+        trainer.save_adapter()
 
     return rows
 
@@ -287,7 +309,12 @@ def run_glm_ttt_search(
     ctx = ctx or SearchContext()
     task = task or build_task(ctx.model)
     generator = GLMGenerator(seed=seed)
-    trainer = TestTimeTrainer(generator, task)
+    trainer = TestTimeTrainer(
+        generator,
+        task,
+        evaluate_fn=ctx.evaluate,
+        run_name="glm_ttt",
+    )
     return _glm_loop(generator, task, rounds, candidates_per_round, "glm_ttt", ctx, trainer=trainer, store=store)
 
 

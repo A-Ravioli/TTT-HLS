@@ -13,6 +13,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
 
+# Load .env from repo root so PRIME_API_KEY / BURN_GLM_* are available to scripts.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(REPO_ROOT / ".env")
+except ImportError:
+    pass
+
 ARTIFACTS_DIR = REPO_ROOT / "artifacts"
 BUILD_DIR = REPO_ROOT / "build"
 RESULTS_DIR = REPO_ROOT / "results"

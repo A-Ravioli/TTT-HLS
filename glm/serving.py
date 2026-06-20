@@ -312,8 +312,116 @@ class HFBackend(GLMBackend):
 
 
 # ---------------------------------------------------------------------------
+# Prime Intellect Inference API (OpenAI-compatible, no local weights)
+# ---------------------------------------------------------------------------
+
+PRIME_INFERENCE_BASE_URL = "https://api.pinference.ai/api/v1"
+DEFAULT_PRIME_MODEL = "z-ai/glm-5.2"
+
+
+class PrimeBackend(GLMBackend):
+    """GLM via Prime Intellect Inference API (OpenAI-compatible).
+
+    Uses ``PRIME_API_KEY`` and ``BURN_GLM_MODEL`` (default ``z-ai/glm-5.2``).
+    Supports generation for config-author and HLS compiler-author modes.
+    Test-time LoRA requires :class:`HFBackend` on a local GPU — this backend
+    falls back to :meth:`HeuristicBackend.adapt` for the TTT hook.
+    """
+
+    name = "prime"
+    is_llm = True
+
+    def __init__(
+        self,
+        model_id: str | None = None,
+        max_new_tokens: int | None = None,
+        temperature: float = 0.7,
+        api_key: str | None = None,
+        base_url: str = PRIME_INFERENCE_BASE_URL,
+        team_id: str | None = None,
+    ):
+        self.model_id = (model_id or os.environ.get("BURN_GLM_MODEL", "").strip() or DEFAULT_PRIME_MODEL)
+        self.max_new_tokens = max_new_tokens or int(os.environ.get("BURN_GLM_MAX_TOKENS", "8192"))
+        self.temperature = temperature
+        self.api_key = api_key or os.environ.get("PRIME_API_KEY", "").strip()
+        self.base_url = base_url
+        self.team_id = (team_id or os.environ.get("PRIME_TEAM_ID", "")).strip() or None
+        self._client = None
+
+    def _ensure_client(self) -> None:
+        if self._client is not None:
+            return
+        from openai import OpenAI
+
+        headers = {}
+        if self.team_id:
+            headers["X-Prime-Team-ID"] = self.team_id
+        self._client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            default_headers=headers or None,
+        )
+        logger.info("Prime Inference backend: model=%s max_tokens=%d", self.model_id, self.max_new_tokens)
+
+    def _generate(self, system: str, user: str, n: int) -> list[str]:
+        self._ensure_client()
+        texts: list[str] = []
+        for _ in range(max(1, n)):
+            resp = self._client.chat.completions.create(
+                model=self.model_id,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_new_tokens,
+            )
+            content = resp.choices[0].message.content or ""
+            texts.append(content)
+        return texts
+
+    def propose_configs(self, task_desc, history, n, exclude, rng):
+        from glm.parsing import parse_configs
+        from glm.prompts import SYSTEM_PROMPT, build_propose_prompt
+
+        prompt = build_propose_prompt(task_desc, history, n)
+        configs: list[BurnConfig] = []
+        seen = set(exclude)
+        for text in self._generate(SYSTEM_PROMPT, prompt, n=max(1, n)):
+            for cfg in parse_configs(text):
+                if cfg.short_name() not in seen:
+                    seen.add(cfg.short_name())
+                    configs.append(cfg)
+        return configs[:n]
+
+    def repair_config(self, task_desc, failed_config, error_msg, rng):
+        from glm.parsing import parse_configs
+        from glm.prompts import SYSTEM_PROMPT, build_repair_prompt
+
+        prompt = build_repair_prompt(task_desc, failed_config, error_msg)
+        for text in self._generate(SYSTEM_PROMPT, prompt, n=1):
+            cfgs = parse_configs(text)
+            if cfgs:
+                return cfgs[0]
+        return None
+
+    def adapt(self, trajectories: list[dict[str, Any]]) -> dict[str, Any]:
+        """Remote API has no local weights; use heuristic-style history sharpening."""
+        helper = HeuristicBackend()
+        return helper.adapt(trajectories)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
+
+def llm_generate(backend: GLMBackend, system: str, user: str, n: int = 1) -> list[str]:
+    """Call ``_generate`` on HF or Prime backends."""
+    gen = getattr(backend, "_generate", None)
+    if gen is None:
+        raise TypeError(f"Backend {backend.name!r} is not an LLM backend")
+    return gen(system, user, n)
+
 
 def transformers_available() -> bool:
     try:
@@ -325,14 +433,27 @@ def transformers_available() -> bool:
         return False
 
 
+def prime_available() -> bool:
+    """True if PRIME_API_KEY is set and the openai client is importable."""
+    if not os.environ.get("PRIME_API_KEY", "").strip():
+        return False
+    try:
+        import openai  # noqa: F401
+
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def load_backend(prefer: str | None = None) -> GLMBackend:
     """Return a GLM backend.
 
     Selection order:
-    1. ``prefer`` / ``BURN_GLM_BACKEND`` if it forces "heuristic" or "hf".
-    2. A real :class:`HFBackend` if ``BURN_GLM_MODEL`` is set and transformers is
-       importable.
-    3. The :class:`HeuristicBackend` stand-in otherwise.
+    1. ``prefer`` / ``BURN_GLM_BACKEND`` if it forces ``heuristic``, ``prime``, or ``hf``.
+    2. :class:`PrimeBackend` if backend is ``prime`` or ``PRIME_API_KEY`` is set
+       (and backend is not explicitly ``hf``).
+    3. :class:`HFBackend` if ``BURN_GLM_MODEL`` is set and transformers is importable.
+    4. The :class:`HeuristicBackend` stand-in otherwise.
     """
     choice = (prefer or os.environ.get("BURN_GLM_BACKEND", "")).strip().lower()
     model_id = os.environ.get("BURN_GLM_MODEL", "").strip()
@@ -341,7 +462,13 @@ def load_backend(prefer: str | None = None) -> GLMBackend:
         logger.info("Using heuristic GLM backend (forced).")
         return HeuristicBackend()
 
-    if choice == "hf" or (not choice and model_id):
+    if choice == "prime" or (not choice and prime_available()):
+        if prime_available():
+            logger.info("Using Prime Inference GLM backend: %s", model_id or DEFAULT_PRIME_MODEL)
+            return PrimeBackend(model_id=model_id or None)
+        logger.warning("Prime backend requested but PRIME_API_KEY / openai unavailable.")
+
+    if choice == "hf" or (model_id and not prime_available()):
         if model_id and transformers_available():
             logger.info("Using real GLM (HF) backend: %s", model_id)
             return HFBackend(model_id=model_id)
@@ -352,5 +479,5 @@ def load_backend(prefer: str | None = None) -> GLMBackend:
             transformers_available(),
         )
 
-    logger.info("Using heuristic GLM backend (no BURN_GLM_MODEL / transformers).")
+    logger.info("Using heuristic GLM backend (no GLM backend configured).")
     return HeuristicBackend()

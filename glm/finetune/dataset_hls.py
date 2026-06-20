@@ -8,7 +8,6 @@ Produces:
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,12 +38,38 @@ def _sources_to_completion(sources: dict[str, str]) -> str:
     return "\n\n".join(parts)
 
 
-def _valid_hls(row: dict[str, Any]) -> bool:
-    """A trajectory row is usable for SFT if it compiled and has sources."""
+def _passes_accuracy(row: dict[str, Any], max_error_threshold: float) -> bool:
+    max_err = row.get("max_error")
+    if max_err is None:
+        return True
+    try:
+        return float(max_err) <= max_error_threshold
+    except (TypeError, ValueError):
+        return False
+
+
+def _valid_hls(row: dict[str, Any], max_error_threshold: float = 0.01) -> bool:
+    """Row is usable for SFT/DPO chosen: compiled, cosim pass, within accuracy."""
     return (
-        row.get("hls_compile_success", False)
+        bool(row.get("hls_compile_success", False))
+        and bool(row.get("cosim_pass", False))
         and row.get("sources") is not None
         and row.get("reward") is not None
+        and _passes_accuracy(row, max_error_threshold)
+    )
+
+
+def _hls_propose_prompt(
+    task: FpgaTask,
+    hidden_dim: int,
+    intermediate_dim: int,
+) -> str:
+    return build_hls_propose_prompt(
+        block_spec=task.describe(),
+        part=task.target_part,
+        clock_ns=3.3,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
     )
 
 
@@ -56,7 +81,8 @@ def to_hls_sft_examples(
     intermediate_dim: int = 64,
 ) -> list[HLSSFTExample]:
     """SFT on HLS kernels whose reward is in the top fraction for this task."""
-    valid = [r for r in rows if _valid_hls(r)]
+    threshold = task.max_error_threshold
+    valid = [r for r in rows if _valid_hls(r, threshold)]
     if not valid:
         return []
 
@@ -64,13 +90,7 @@ def to_hls_sft_examples(
     cutoff_idx = max(1, int(len(rewards) * top_frac))
     cutoff = rewards[min(cutoff_idx, len(rewards) - 1)]
 
-    prompt = build_hls_propose_prompt(
-        block_spec=task.describe(),
-        part=task.target_part,
-        clock_ns=3.3,
-        hidden_dim=hidden_dim,
-        intermediate_dim=intermediate_dim,
-    )
+    prompt = _hls_propose_prompt(task, hidden_dim, intermediate_dim)
 
     examples = []
     for r in sorted(valid, key=lambda x: float(x["reward"]), reverse=True):
@@ -88,21 +108,16 @@ def to_hls_preference_pairs(
     intermediate_dim: int = 64,
 ) -> list[HLSPreferencePair]:
     """DPO pairs: higher-reward HLS kernels preferred over lower-reward ones."""
+    threshold = task.max_error_threshold
     valid = sorted(
-        [r for r in rows if _valid_hls(r)],
+        [r for r in rows if _valid_hls(r, threshold)],
         key=lambda x: float(x["reward"]),
         reverse=True,
     )
     if len(valid) < 2:
         return []
 
-    prompt = build_hls_propose_prompt(
-        block_spec=task.describe(),
-        part=task.target_part,
-        clock_ns=3.3,
-        hidden_dim=hidden_dim,
-        intermediate_dim=intermediate_dim,
-    )
+    prompt = _hls_propose_prompt(task, hidden_dim, intermediate_dim)
 
     pairs: list[HLSPreferencePair] = []
     n = len(valid)
@@ -119,4 +134,45 @@ def to_hls_preference_pairs(
                 )
                 if len(pairs) >= max_pairs:
                     return pairs
+    return pairs
+
+
+def to_hls_repair_preference_pairs(
+    task: FpgaTask,
+    rows: list[dict[str, Any]],
+    max_pairs: int = 16,
+    hidden_dim: int = 24,
+    intermediate_dim: int = 64,
+) -> list[HLSPreferencePair]:
+    """Mine (failed, repaired) HLS pairs from repair-tagged trajectories."""
+    threshold = task.max_error_threshold
+    prompt = _hls_propose_prompt(task, hidden_dim, intermediate_dim)
+    pairs: list[HLSPreferencePair] = []
+
+    for r in rows:
+        method = str(r.get("method", ""))
+        if "_repair" not in method and not r.get("is_repair"):
+            continue
+        if not _valid_hls(r, threshold):
+            continue
+        round_idx = r.get("round_idx", r.get("round"))
+        failed = None
+        for prev in rows:
+            if prev is r:
+                break
+            prev_round = prev.get("round_idx", prev.get("round"))
+            if prev_round == round_idx and not prev.get("cosim_pass"):
+                failed = prev
+        if failed and failed.get("sources"):
+            pairs.append(
+                HLSPreferencePair(
+                    HLS_SYSTEM_PROMPT,
+                    prompt,
+                    _sources_to_completion(r["sources"]),
+                    _sources_to_completion(failed["sources"]),
+                )
+            )
+            if len(pairs) >= max_pairs:
+                return pairs
+
     return pairs

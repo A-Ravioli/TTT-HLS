@@ -23,6 +23,7 @@ tabulate
 
 # Dev / tests
 pytest>=7.0
+python-dotenv>=1.0
 
 # Optional: only needed on a real PYNQ board for FPGA deployment.
 # Installed automatically on the board's PYNQ image; left commented here.

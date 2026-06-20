@@ -22,6 +22,7 @@ from compiler.kernel_lib.swiglu_mlp import SwiGLUConfig, generate_full_bundle
 from glm.agent_hls import GLMCompilerAgent, result_to_hls_history_row
 from glm.finetune.trainer_hls import HLSTestTimeTrainer
 from glm.tasks import FpgaTask, make_task
+from infra import wandb_run
 from infra.trace_store import HLSTraceStore
 from models.qwen.blocks import build_mlp_keras, tile_dims
 from models.qwen.decompose import mlp_block_spec
@@ -46,6 +47,14 @@ def main():
     args = parser.parse_args()
 
     ensure_dirs()
+    wandb_run.init_run(
+        config={
+            "rounds": args.rounds,
+            "part": args.part,
+            "max_error": args.max_error,
+            "tile_div": args.tile_div,
+        }
+    )
     arch = get_default_arch()
     dims = tile_dims(arch, args.tile_div)
 
@@ -117,6 +126,7 @@ def main():
             round_idx=r,
             method=method,
         )
+        wandb_run.log_eval(len(history), method, result, round_idx=r)
 
         # Update best
         if best_result is None or result.get("reward", -1e9) > best_result.get("reward", -1e9):
@@ -178,8 +188,12 @@ def main():
 
         # TTT step
         if trainer is not None and len(history) >= 2:
-            ttt_info = trainer.step(history)
+            ttt_info = trainer.step(history, round_idx=r)
+            wandb_run.log_ttt_step(len(history), ttt_info)
             logger.info("TTT step: %s", ttt_info)
+
+    if trainer is not None:
+        trainer.save_adapter()
 
     # Summary
     logger.info("=== GLM HLS Loop Complete ===")
@@ -191,6 +205,7 @@ def main():
         logger.info("  reward:     %.1f", best_result.get("reward", -1e9))
         logger.info("  tps:        %s", best_result.get("tokens_per_sec"))
     logger.info("Traces stored in %s", store._path)
+    wandb_run.finish()
 
 
 if __name__ == "__main__":

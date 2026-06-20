@@ -24,6 +24,7 @@ import pandas as pd  # noqa: E402
 from glm.finetune import lora as lora_mod  # noqa: E402
 from glm.serving import load_backend  # noqa: E402
 from infra.launch import describe_placement  # noqa: E402
+from infra import wandb_run  # noqa: E402
 from paths import RUNS_CSV, get_logger, get_target_part  # noqa: E402
 from ttt.search import run_full_search  # noqa: E402
 
@@ -84,6 +85,17 @@ def main() -> None:
     print(f"Device placement : {describe_placement()}")
     print(f"Real LoRA path   : {backend.is_llm and lora_mod.peft_available()}")
 
+    run = wandb_run.init_run(
+        config={
+            "rounds": args.rounds,
+            "candidates_per_round": args.candidates_per_round,
+            "backend": backend.name,
+            "part": get_target_part(),
+        }
+    )
+    if run is not None:
+        print(f"wandb run: {run.url}")
+
     df = run_full_search(
         rounds=args.rounds,
         candidates_per_round=args.candidates_per_round,
@@ -96,6 +108,7 @@ def main() -> None:
     _print_reward_curves(df)
     print(f"\nResults written to: {RUNS_CSV}")
     print("Next: streamlit run dashboard/app.py")
+    wandb_run.finish()
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ from glm.prompts.hls_templates import (
     build_hls_propose_prompt,
     build_hls_repair_prompt,
 )
-from glm.serving import GLMBackend, HFBackend, HeuristicBackend, load_backend
+from glm.serving import GLMBackend, load_backend, llm_generate
 from glm.tasks import FpgaTask
 from compiler.kernel_lib.swiglu_mlp import SwiGLUConfig, generate_full_bundle
 from paths import get_logger
@@ -80,7 +80,7 @@ class GLMCompilerAgent:
         If a real LLM backend is available, generates via prompting.
         Otherwise returns a parametrically varied seed template.
         """
-        if isinstance(self.backend, HFBackend):
+        if self.backend.is_llm:
             return self._propose_llm(task, history, hidden_dim, intermediate_dim, seed_bundle)
         return self._propose_heuristic(task, history, hidden_dim, intermediate_dim, seed_bundle)
 
@@ -98,7 +98,7 @@ class GLMCompilerAgent:
         if error_type is None:
             return None  # Not a failure
 
-        if isinstance(self.backend, HFBackend):
+        if self.backend.is_llm:
             return self._repair_llm(task, bundle, result, error_type)
         return self._repair_heuristic(task, bundle, result, error_type)
 
@@ -110,7 +110,7 @@ class GLMCompilerAgent:
         best_metrics: dict[str, Any] | None = None,
     ) -> KernelBundle:
         """Iterate on a passing kernel to improve performance."""
-        if isinstance(self.backend, HFBackend):
+        if self.backend.is_llm:
             return self._iterate_llm(task, bundle, current_metrics, best_metrics)
         return self._iterate_heuristic(task, bundle, current_metrics, best_metrics)
 
@@ -191,9 +191,8 @@ class GLMCompilerAgent:
         return bundle  # Return unchanged if parsing fails
 
     def _generate(self, user_prompt: str) -> list[str]:
-        """Generate text from the backend."""
-        backend: HFBackend = self.backend  # type: ignore[assignment]
-        return backend._generate(HLS_SYSTEM_PROMPT, user_prompt, n=1)
+        """Generate text from any LLM backend (HF local or Prime Inference)."""
+        return llm_generate(self.backend, HLS_SYSTEM_PROMPT, user_prompt, n=1)
 
     # -- Heuristic paths (no LLM) -------------------------------------------
 
