@@ -1,54 +1,97 @@
-# 🔥 BurnTTT — a test-time-adaptive model-to-FPGA compiler
+# 🔥 BurnTTT — a GLM that compiles models onto FPGAs, finetuned at test time
 
-BurnTTT takes a tiny neural network, compiles it onto FPGA fabric with
-[`hls4ml`](https://github.com/fastmachinelearning/hls4ml), and **adapts the
-compiler at test time** — searching precision / reuse / strategy knobs using
-real quantization-accuracy and resource feedback from *this exact model and FPGA
-target* — to find a hardware configuration that beats the naive default and a
-random-search baseline.
+BurnTTT is a **test-time-trained LLM compiler**. An LLM (**GLM**) *authors* the
+hardware-generation config that maps a neural-network block onto FPGA fabric via
+[`hls4ml`](https://github.com/fastmachinelearning/hls4ml), and its **weights are
+finetuned (LoRA) at test time** on real quantization-accuracy and resource
+feedback from *this exact model block and FPGA target* — so it produces a hardware
+configuration that beats the naive default, a random-forest surrogate baseline,
+and random search.
+
+The north-star workload is **Qwen-2B on FPGA**, reached by scaling from a toy
+feed-forward block up through a single Qwen-2B transformer sub-block.
 
 ```
-tiny Keras model → quantize → hls4ml → HLS/RTL project → (synthesis) → live inference
-                          ▲
-                          └── BurnTTT online policy adapts the compiler config
+model block → GLM authors hls4ml config → HLS/RTL → bit-accurate sim + (synthesis) → reward
+                     ▲                                                                    │
+                     └──────────── LoRA test-time finetune on this task's feedback ◄──────┘
 ```
 
 ## 1. What BurnTTT is
 
-Picking the hardware-generation config for an FPGA model is a search problem:
-too much precision or too little reuse and the design **won't fit the board**;
-too little precision and the **accuracy drifts**. The sweet spot depends on the
-specific model *and* the specific FPGA part.
+Picking the hardware-generation config for an FPGA model is a search problem: too
+much precision or too little reuse and the design **won't fit the board**; too
+little precision and the **accuracy drifts**. The sweet spot depends on the
+specific model block *and* the specific FPGA part.
 
-BurnTTT treats each `(model, FPGA part)` pair as a fresh task and runs a small
-**online policy** that:
+BurnTTT treats each `(model-block, FPGA-part)` pair as a **fresh task** and runs a
+GLM generator that:
 
-1. Starts from hand-picked seed configs spanning the accuracy/resource spectrum.
-2. Evaluates each config: hls4ml conversion → bit-accurate prediction error →
-   (synthesis if available, else an analytical resource estimate) → reward.
-3. Trains a `RandomForestRegressor` surrogate on the `(config → reward)` pairs
-   seen *so far*.
-4. Proposes the next configs by scoring a candidate pool (random exploration +
-   single-step neighbors of the best-known configs) and picking the predicted
-   best — a surrogate-guided hill-climb.
-5. Repeats for a configurable number of rounds and writes everything to
-   `results/runs.csv`.
+1. **Authors** candidate hardware configs (quantization precision, per-layer reuse
+   factors, HLS strategy/IO mode) from a structured prompt describing the block,
+   the part, its resource budget, and the feedback seen so far.
+2. **Evaluates** each config: hls4ml conversion → bit-accurate prediction error →
+   (synthesis if available, else an analytical resource/throughput estimate) →
+   scalar reward.
+3. **Repairs** configs that fail to compile, by feeding the compiler error back to
+   GLM (an agentic compiler loop).
+4. **Finetunes its own weights** (LoRA) on the high-reward trajectories from this
+   task, between rounds — the honest test-time training — then proposes again.
 
-A **random-search baseline** runs on an equal evaluation budget so the dashboard
-can compare `default hls4ml` vs `random search` vs `BurnTTT`.
+A **random-forest surrogate** ([baselines/random_forest_policy.py](baselines/random_forest_policy.py))
+and **random search** run on an equal evaluation budget so the dashboard compares
+`default hls4ml` vs `random search` vs `random forest` vs `GLM (frozen)` vs
+`GLM (test-time finetuned)`.
 
 ## 2. The honest TTT framing
 
-> **BurnTTT does not train the FPGA model after deployment. It adapts the compiler
-> at test time before deployment, using simulation and synthesis feedback from the
-> specific model and FPGA target.**
+> **The deployed FPGA logic is fixed. The test-time training happens in the
+> *generator*: GLM's own (LoRA) weights are updated during the run, on feedback
+> from this specific model block and FPGA part, so it authors better hardware the
+> longer it works on the task.**
 
-The deployed FPGA network is *fixed*. The "test-time training" is in the
-**compiler loop**: the surrogate policy is (re)fit online, during the run, on
-feedback measured from the real model + target. This is test-time adaptation of
-the *generator*, not online learning of the deployed weights.
+This is genuine test-time *training* (weights change), not just selection — but of
+the **compiler/generator**, not of the deployed network. The deployed accelerator
+is a fixed bitstream.
 
-## 3. Install
+### Runs anywhere (graceful degradation)
+
+Every external dependency is optional and degrades gracefully:
+
+- **No GLM weights / GPU / `transformers`?** A deterministic, history-driven
+  **heuristic backend** ([glm/serving.py](glm/serving.py)) stands in for the LLM
+  and is adapted analogously, so the full loop (including a measurable test-time
+  improvement) still runs and is testable. Set `BURN_GLM_MODEL` to use a real GLM.
+- **No Vivado/Vitis?** Resources/latency/throughput are **analytical estimates**;
+  accuracy (`max_error`) is always real, bit-accurate hls4ml output. Pass
+  `--synth` with a toolchain for real numbers.
+- **No FPGA board?** A software bit-accurate equivalence demo runs instead.
+
+## 3. Architecture
+
+```
+                  ┌──────────────────────────────────────────────┐
+   FpgaTask ─────▶│ Prompt: block spec + part budget + feedback   │
+ (block, part)    └───────────────────────┬──────────────────────┘
+                                           ▼
+                              ┌─────────────────────────┐
+                              │ GLM generator (LoRA)     │  glm/agent.py
+                              └────────────┬────────────┘
+                                           ▼  hls4ml config (or per-layer BlockConfig)
+                  ┌────────────────────────────────────────────────┐
+                  │ Feedback engine: convert → C-sim error →        │  ttt/evaluate_config.py
+                  │ synth/estimate → reward + throughput            │
+                  └───────────────┬───────────────────┬────────────┘
+                                  │ reward + feedback  │ trajectories
+                       repair ◀───┘                    ▼  data/trajectories/*.jsonl
+                                            ┌─────────────────────────┐
+                                            │ Test-time finetune       │  glm/finetune/
+                                            │ LoRA step on this task   │
+                                            └────────────┬────────────┘
+                                                         └─▶ better GLM next round
+```
+
+## 4. Install
 
 Requires Python 3.10 or 3.11 (hls4ml 1.0.0 pins TensorFlow ≤ 2.14).
 
@@ -58,113 +101,66 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-A C++ compiler (`g++`) is needed for hls4ml's bit-accurate C simulation (used to
-measure quantization error). Vivado/Vitis HLS is **optional** — without it,
-BurnTTT uses an analytical resource/latency estimator and still produces a full
-comparison.
-
-## 4. Run the full demo
+For a **real GLM + test-time LoRA finetuning**, also install the LLM extras and
+point at GLM weights:
 
 ```bash
-python scripts/00_train_model.py                 # train + export tiny model
-python scripts/01_baseline_compile.py            # compile the default hls4ml config
-python scripts/02_run_burnttt_search.py          # baseline + BurnTTT + random search
-streamlit run dashboard/app.py                   # visualize the results
+pip install -r requirements-glm.txt          # torch, transformers, peft, accelerate
+export BURN_GLM_MODEL=THUDM/glm-4-9b-chat     # a local path or HF repo id
 ```
 
-Optional hardware path (graceful stubs off-board):
+Without those, BurnTTT uses the heuristic backend automatically.
+
+## 5. Run the pipeline
 
 ```bash
-python scripts/03_build_best_bitstream.py        # build best config's HLS/bitstream project
+python scripts/00_train_model.py                 # train + export the toy FFN block
+python scripts/01_baseline_compile.py            # compile the default hls4ml config
+python scripts/08_eval_glm_generator.py          # default vs random vs RF vs GLM vs GLM+TTT
+streamlit run dashboard/app.py                   # visualize the comparison
+```
+
+Test-time finetuning loop with reward-vs-step logging:
+
+```bash
+python scripts/06_collect_trajectories.py        # collect (config → feedback) trajectories
+python scripts/07_ttt_finetune_glm.py            # finetune GLM at test time; chart reward-vs-step
+```
+
+Scale toward Qwen-2B:
+
+```bash
+python scripts/05_ingest_qwen.py                 # decompose Qwen + feasibility report
+python scripts/05_ingest_qwen.py --export        # build a tiled, compilable Qwen MLP block
+python scripts/09_block_to_fpga_demo.py --block qwen_mlp   # block demo + full-model plan
+```
+
+Hardware path (graceful stubs off-board):
+
+```bash
+python scripts/03_build_best_bitstream.py        # build the best config's HLS/bitstream project
 python scripts/04_run_fpga_demo.py               # run on a PYNQ board, or software-equivalence demo
 ```
 
-Tune the search:
+## 6. GLM backends and env vars
 
-```bash
-python scripts/02_run_burnttt_search.py --rounds 4 --candidates-per-round 3
-python scripts/02_run_burnttt_search.py --synth   # run real HLS synthesis per config (needs Vivado)
-```
+| Variable             | Effect                                                            |
+|----------------------|------------------------------------------------------------------|
+| `BURN_GLM_MODEL`     | Local path or HF repo id of the GLM to load (enables real LLM).   |
+| `BURN_GLM_BACKEND`   | Force `heuristic` or `hf`.                                        |
+| `BURN_TARGET_PART`   | FPGA part (default PYNQ-Z2 `xc7z020clg400-1`).                    |
+| `BURN_BOARD`         | Board name for VivadoAccelerator bitstreams.                     |
 
-### Example result (PYNQ-Z2, no Vivado — analytical estimates)
+Backend selection lives in `load_backend()` ([glm/serving.py](glm/serving.py)):
+real `HFBackend` if `BURN_GLM_MODEL` is set and `transformers` is importable, else
+the `HeuristicBackend`. The test-time trainer ([glm/finetune/trainer.py](glm/finetune/trainer.py))
+runs real LoRA steps when `peft`/`torch` are present, and adapts the heuristic
+otherwise — same interface either way.
 
-| Method            | Best config            | Max error | DSP  | LUT  | Fits board? | Reward |
-|-------------------|------------------------|-----------|------|------|-------------|--------|
-| Default hls4ml    | `w16a16i6_r1-1_Lat`    | 0.058     | 1536 | 69520| **No**      | -4916  |
-| Random search     | `w16a16i4_r16-16_Res`  | 0.016     | 59   | 4720 | Yes         | 699.6  |
-| **BurnTTT**       | `w12a12i3_r16-16_Res`  | 0.117     | 59   | 3640 | Yes         | **748.6** |
+## 7. Config space
 
-The naive default **does not fit** the FPGA (1536 DSPs ≫ 220 available). BurnTTT
-discovers that dropping to 12-bit with *more fractional bits* (`int_bits=3`) and
-full layer reuse keeps the error well under threshold while using the least
-fabric — beating even a lucky random hit on a 16-bit config.
-
-## 5. Artifacts produced
-
-```
-artifacts/tiny_ffn.keras        # trained Keras model
-artifacts/test_inputs.npy       # golden test inputs
-artifacts/golden_outputs.npy    # golden float32 outputs
-artifacts/best_config.json      # best config found (written by script 03)
-build/baseline/...              # default-config HLS project
-build/eval/...                  # per-config HLS projects from the search
-build/best/...                  # best config's HLS/bitstream project
-results/runs.csv                # every evaluation (method, config, error, resources, reward)
-```
-
-## 6. Targeting a specific FPGA part / board
-
-The default part is the PYNQ-Z2 (`xc7z020clg400-1`). Override with env vars — no
-part is hardcoded:
-
-```bash
-export BURN_TARGET_PART=xcu250-figd2104-2L-e   # e.g. an Alveo U250
-export BURN_BOARD=pynq-z2                       # board name for VivadoAccelerator bitstreams
-python scripts/02_run_burnttt_search.py
-```
-
-The on-board resource budget used for the "fits board?" check lives in
-`ttt/reward.py` (`BOARD_BUDGET`) and reflects the PYNQ-Z2; adjust it for other
-boards.
-
-## 7. The dashboard
-
-```bash
-streamlit run dashboard/app.py
-```
-
-Shows: headline metrics, the best config + resource utilization vs the board
-budget, **best-reward-over-evaluations** (random vs BurnTTT) on an equal budget,
-a method comparison table, the accuracy-vs-latency tradeoff scatter, the full
-results table, and an explainer of what "TTT" means here.
-
-## 8. Reward function
-
-Implemented in `ttt/reward.py` (see plan.md §9). In words: a compile failure is
-the worst outcome; accuracy drift past a threshold is heavily penalized; designs
-over the board's resource budget are penalized; otherwise reward favors low
-latency and low resource usage.
-
-```python
-def reward(result):
-    if not result["compile_success"]:
-        return -1000
-    if result["max_error"] is not None and result["max_error"] > 0.25:
-        return -500 - 100 * result["max_error"]
-    return (
-        1000
-        - 0.05 * latency_cycles
-        - 1.0  * dsp
-        - 0.05 * lut
-        - 0.1  * bram
-        - 50.0 * max_error
-    )  # plus penalties for exceeding the board resource budget
-```
-
-## 9. Config space
-
-`ttt/config_space.py` defines `BurnConfig(weight_bits, activation_bits, int_bits,
-reuse_dense_1, reuse_dense_2, strategy)` over:
+`ttt/config_space.py` defines the artifact GLM authors. The compact `BurnConfig`
+(uniform precision/reuse) over:
 
 ```
 bits:   8, 10, 12, 14, 16
@@ -173,20 +169,46 @@ reuse:  1, 2, 4, 8, 16
 strat:  Latency, Resource
 ```
 
-Precision maps to `ap_fixed<bits,int>`; `int_bits` is the integer part, so fewer
-integer bits = more fractional bits = lower quantization error (until integer
-overflow).
+and the richer `BlockConfig` for multi-layer blocks (e.g. Qwen's SwiGLU MLP):
+**per-layer** precision/reuse plus block-wide strategy and `io_parallel`/
+`io_stream` dataflow. Precision maps to `ap_fixed<bits,int>`; fewer integer bits =
+more fractional bits = lower quantization error (until integer overflow).
+
+## 8. Reward function
+
+Implemented in `ttt/reward.py`. A compile failure is the worst outcome; accuracy
+drift past a threshold is heavily penalized; designs over the **part's** resource
+budget are penalized; otherwise reward favors low latency and low resource use.
+Budgets are per-part (`BOARD_BUDGETS`): a toy FFN fits a PYNQ-Z2, while a Qwen
+block is judged against a large part (e.g. Alveo U250).
+
+## 9. The dashboard
+
+```bash
+streamlit run dashboard/app.py
+```
+
+Shows headline metrics, the best config + resource utilization vs the board
+budget, **best-reward-over-evaluations** for every method on an equal budget, a
+method comparison table, the accuracy-vs-latency tradeoff scatter, the full
+results table, and an explainer of what "test-time training" means here.
 
 ## 10. Repository layout
 
 ```
-models/      tiny_ffn.py, train_toy_model.py, export_model.py
-compiler/    make_hls_config, build_hls4ml_project, run_hls, parse_reports,
-             estimate_resources, deploy_pynq
-ttt/         config_space, reward, evaluate_config, online_policy, search
+models/      tiny_ffn (toy block) + qwen/ (load, decompose, blocks, orchestrate)
+compiler/    make_hls_config (+ per-layer), build_hls4ml_project, run_hls,
+             parse_reports, estimate_resources (+ throughput), deploy_pynq
+glm/         tasks, prompts/, parsing, serving (HF + heuristic), agent,
+             trajectories, finetune/ (lora, dataset, trainer)   ← the GLM compiler
+ttt/         config_space (BurnConfig + BlockConfig), reward (per-part),
+             evaluate_config (feedback engine), search (GLM + baselines)
+baselines/   random_forest_policy (the former headline, now a baseline)
+infra/       staged_eval (sim→synth→bitstream funnel), launch (GPU placement)
 dashboard/   app.py (Streamlit)
-scripts/     00_train_model … 04_run_fpga_demo
-tests/       config-serialization + reward + policy smoke tests
+scripts/     00_train … 09_block_to_fpga_demo
+tests/       config/reward/policy + GLM agent + Qwen decomposition tests
+data/        trajectory store (jsonl) + LoRA adapters
 paths.py     shared paths / logging / target-part helpers
 ```
 
@@ -196,28 +218,41 @@ Run the tests with:
 python -m pytest tests -q
 ```
 
-## 11. Known limitations
+## 11. Roadmap / phases
 
-- **Tiny model.** A 16→64→8 feedforward block — intentionally small so
-  conversion/synthesis is fast. Not a transformer or LLM.
-- **Estimates without Vivado.** Off-toolchain, latency/resources are *analytical
-  estimates* (`compiler/estimate_resources.py`); accuracy (`max_error`) is always
-  real, bit-accurate hls4ml output. Install Vivado and pass `--synth` for real
-  synthesis numbers parsed from the reports.
-- **Surrogate is simple.** A random forest over a small discrete space; the value
-  is the *online adaptation loop*, not a fancy optimizer.
-- **FPGA deployment is optional.** Without a PYNQ board, script 04 runs a
-  software bit-accurate equivalence demo and explains the on-board steps.
+- **Phase 1 (done):** GLM authors configs (replacing the random forest), with a
+  compile-error repair loop, on the toy block.
+- **Phase 2 (done):** Test-time LoRA finetuning of GLM on per-task feedback;
+  reward-vs-step shows GLM+TTT climbing above frozen GLM and the RF baseline.
+- **Phase 3 (done):** Qwen-2B ingestion + decomposition; a tiled, compilable
+  SwiGLU MLP sub-block; per-layer `BlockConfig`; per-part budgets + throughput.
+- **Phase 4 (stubs):** Full-model orchestration — tiling, weight streaming, KV
+  cache, attention softmax/RoPE kernels, multi-FPGA partitioning, host code. See
+  [models/qwen/orchestrate.py](models/qwen/orchestrate.py).
 
-## 12. What to say in a hackathon demo
+## 12. Known limitations
 
-1. "Here's a tiny model. The **default** FPGA compile uses 1536 DSPs — it
-   **doesn't fit** a PYNQ-Z2."
-2. "BurnTTT runs an **online policy** that adapts the *compiler* at test time
-   using accuracy + resource feedback from this exact model and board."
-3. Show the dashboard: **BurnTTT's best-reward curve climbs above random** on an
-   equal budget, and its best config **fits the board** with the lowest fabric
-   cost.
-4. "The deployed network is fixed — the **test-time training is in the
-   compiler loop**, before deployment."
-5. (If Vivado/PYNQ present) "And here it is running on real silicon."
+- **The honest target today is a single block + GLM test-time finetune.** Full
+  Qwen-2B-on-FPGA is the north star, with the remaining work made explicit (not
+  hidden) in `models/qwen/orchestrate.py`.
+- **Attention is not hls4ml-native.** The q/k/v/o projections compile, but
+  softmax/RoPE need FINN or hand-written HLS — flagged as a research stub. The MLP
+  block is the first real milestone.
+- **Estimates without Vivado.** Off-toolchain, latency/resources/throughput are
+  analytical estimates; accuracy is always real, bit-accurate hls4ml output.
+- **Heuristic stand-in off-GPU.** Without GLM weights the heuristic backend
+  demonstrates the same loop; the real contribution is the LoRA test-time loop
+  when a GLM is present.
+
+## 13. What to say in a demo
+
+1. "We treat each `(model block, FPGA part)` as a fresh task."
+2. "**GLM authors** the hardware config; failed compiles are **repaired** by
+   feeding the error back to the model."
+3. "We **finetune GLM's own weights (LoRA) at test time** on this task's
+   synthesis/simulation feedback — watch the reward-vs-step curve climb above the
+   frozen model and the random-forest baseline."
+4. "The deployed FPGA logic is fixed — the **test-time training is in the
+   generator**, before deployment."
+5. "Toy block today; here's the **Qwen-2B** decomposition and the path to running
+   a real transformer block on the board."

@@ -188,3 +188,85 @@ def neighbors(config: BurnConfig) -> list[BurnConfig]:
 
 def all_field_names() -> Iterable[str]:
     return VECTOR_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# Richer, per-layer config artifact (for multi-layer blocks like Qwen's MLP)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LayerKnobs:
+    """Per-layer quantization + reuse knobs."""
+
+    weight_bits: int
+    activation_bits: int
+    int_bits: int
+    reuse: int
+
+    def __post_init__(self) -> None:
+        if self.int_bits >= max(self.weight_bits, self.activation_bits):
+            raise ValueError(
+                f"int_bits ({self.int_bits}) must be < total bits "
+                f"({max(self.weight_bits, self.activation_bits)})"
+            )
+
+    def weight_precision(self) -> str:
+        return f"ap_fixed<{self.weight_bits},{self.int_bits}>"
+
+    def activation_precision(self) -> str:
+        return f"ap_fixed<{self.activation_bits},{self.int_bits}>"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LayerKnobs":
+        return cls(
+            weight_bits=int(d["weight_bits"]),
+            activation_bits=int(d["activation_bits"]),
+            int_bits=int(d["int_bits"]),
+            reuse=int(d["reuse"]),
+        )
+
+
+@dataclass(frozen=True)
+class BlockConfig:
+    """A per-layer hardware config for a multi-layer block.
+
+    Generalizes :class:`BurnConfig` (which ties all layers to one precision/reuse
+    pair) so the GLM can author distinct precision/reuse per layer plus block-wide
+    strategy and IO/dataflow mode -- the knobs that matter once a block has many
+    differently-shaped matmuls (e.g. Qwen's gate/up/down projections).
+    """
+
+    layers: dict[str, LayerKnobs]
+    strategy: str = "Resource"
+    io_type: str = "io_stream"
+
+    def __post_init__(self) -> None:
+        if self.strategy not in STRATEGIES:
+            raise ValueError(f"strategy must be one of {STRATEGIES}, got {self.strategy}")
+        if self.io_type not in ("io_parallel", "io_stream"):
+            raise ValueError(f"io_type must be io_parallel|io_stream, got {self.io_type}")
+
+    def to_dict(self) -> dict:
+        return {
+            "layers": {name: k.to_dict() for name, k in self.layers.items()},
+            "strategy": self.strategy,
+            "io_type": self.io_type,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BlockConfig":
+        layers = {name: LayerKnobs.from_dict(k) for name, k in d.get("layers", {}).items()}
+        return cls(
+            layers=layers,
+            strategy=str(d.get("strategy", "Resource")),
+            io_type=str(d.get("io_type", "io_stream")),
+        )
+
+    @classmethod
+    def uniform(cls, layer_names: list[str], base: BurnConfig, io_type: str = "io_stream") -> "BlockConfig":
+        """Build a per-layer config where every layer copies a :class:`BurnConfig`."""
+        knobs = LayerKnobs(base.weight_bits, base.activation_bits, base.int_bits, base.reuse_dense_1)
+        return cls(layers={name: knobs for name in layer_names}, strategy=base.strategy, io_type=io_type)

@@ -15,10 +15,11 @@ import pandas as pd
 from tensorflow import keras
 
 from models.export_model import load_golden, load_model
-from paths import RUNS_CSV, ensure_dirs, get_logger
+from paths import RUNS_CSV, ensure_dirs, get_logger, get_target_part
 from ttt.config_space import BurnConfig, sample_random_configs, seed_configs
 from ttt.evaluate_config import evaluate_config
 from ttt.online_policy import OnlineTTTPolicy
+from ttt.reward import get_board_budget
 
 logger = get_logger("burnttt.search")
 
@@ -183,14 +184,128 @@ def run_burnttt_search(
     return rows
 
 
+def build_task(model: keras.Model | None = None, part: str | None = None):
+    """Construct the :class:`~glm.tasks.FpgaTask` for the current model + part."""
+    from glm.tasks import block_from_keras_model, make_task
+
+    model = model or load_model()
+    part = part or get_target_part()
+    block = block_from_keras_model(model, name=getattr(model, "name", "Block"))
+    return make_task(block=block, target_part=part, budget=get_board_budget(part))
+
+
+def _glm_loop(
+    generator,
+    task,
+    rounds: int,
+    candidates_per_round: int,
+    method: str,
+    ctx: SearchContext,
+    trainer=None,
+    store=None,
+) -> list[dict[str, Any]]:
+    """Shared GLM search loop (frozen or test-time-trained).
+
+    Each round the generator proposes configs from the task's feedback history;
+    failed compiles trigger a single repair attempt. When ``trainer`` is given the
+    generator is adapted on the accumulated feedback between rounds (the honest
+    test-time training).
+    """
+    from glm.agent import result_to_history_row
+
+    history: list[dict[str, Any]] = []
+    tried: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    attempt = 0
+
+    def _consume(cfg: BurnConfig, round_idx: int) -> dict[str, Any]:
+        nonlocal attempt
+        result = ctx.evaluate(cfg)
+        history.append(result_to_history_row(result))
+        tried.add(cfg.short_name())
+        rows.append(_record(result, method, attempt=attempt, round_idx=round_idx))
+        if store is not None:
+            store.append(task.name, cfg.to_dict(), result, method=method, round_idx=round_idx)
+        attempt += 1
+        logger.info("[%s r%d] %s reward=%.1f", method, round_idx, cfg.short_name(), result["reward"])
+        return result
+
+    logger.info(
+        "=== GLM search (%s): %d rounds x %d candidates, backend=%s ===",
+        method,
+        rounds,
+        candidates_per_round,
+        generator.backend_name,
+    )
+
+    for r in range(rounds):
+        proposals = generator.propose(task, history, n=candidates_per_round, exclude=tried)
+        for cfg in proposals:
+            result = _consume(cfg, r)
+            # Repair loop: one shot at fixing a config that failed to compile.
+            if not result.get("compile_success"):
+                fixed = generator.repair(task, cfg, result.get("error_msg", ""))
+                if fixed is not None and fixed.short_name() not in tried:
+                    logger.info("[%s r%d] repairing %s -> %s", method, r, cfg.short_name(), fixed.short_name())
+                    _consume(fixed, r)
+        if trainer is not None:
+            info = trainer.step(history)
+            logger.info("[%s] test-time train after round %d: %s", method, r, info)
+
+    return rows
+
+
+def run_glm_search(
+    rounds: int,
+    candidates_per_round: int,
+    seed: int = 0,
+    ctx: SearchContext | None = None,
+    store=None,
+    task=None,
+) -> list[dict[str, Any]]:
+    """GLM generator authoring configs (frozen: no test-time weight updates)."""
+    from glm.agent import GLMGenerator
+
+    ctx = ctx or SearchContext()
+    task = task or build_task(ctx.model)
+    generator = GLMGenerator(seed=seed)
+    return _glm_loop(generator, task, rounds, candidates_per_round, "glm", ctx, trainer=None, store=store)
+
+
+def run_glm_ttt_search(
+    rounds: int,
+    candidates_per_round: int,
+    seed: int = 0,
+    ctx: SearchContext | None = None,
+    store=None,
+    task=None,
+) -> list[dict[str, Any]]:
+    """GLM generator test-time-finetuned on this task's feedback between rounds."""
+    from glm.agent import GLMGenerator
+    from glm.finetune.trainer import TestTimeTrainer
+
+    ctx = ctx or SearchContext()
+    task = task or build_task(ctx.model)
+    generator = GLMGenerator(seed=seed)
+    trainer = TestTimeTrainer(generator, task)
+    return _glm_loop(generator, task, rounds, candidates_per_round, "glm_ttt", ctx, trainer=trainer, store=store)
+
+
 def run_full_search(
     rounds: int = 4,
     candidates_per_round: int = 3,
     seed: int = 0,
     run_synth: bool = False,
     fresh: bool = True,
+    include_glm: bool = False,
+    include_glm_ttt: bool = False,
 ) -> pd.DataFrame:
-    """Run baseline + BurnTTT + equal-budget random search; write runs.csv."""
+    """Run baseline + BurnTTT + equal-budget random search; write runs.csv.
+
+    Optionally also run the frozen GLM generator and the test-time-trained GLM
+    generator on the same evaluation budget so the dashboard can compare all of
+    them head to head.
+    """
     if fresh:
         reset_results()
     ctx = SearchContext(run_synth=run_synth, cleanup=True)
@@ -204,6 +319,19 @@ def run_full_search(
     # Equal evaluation budget for a fair comparison.
     budget = len(burnttt_rows)
     all_rows.extend(run_random_search(budget, seed=seed + 100, ctx=ctx))
+
+    if include_glm or include_glm_ttt:
+        from glm.trajectories import TrajectoryStore
+
+        task = build_task(ctx.model)
+        if include_glm:
+            store = TrajectoryStore(run_name="glm")
+            all_rows.extend(run_glm_search(rounds, candidates_per_round, seed=seed, ctx=ctx, store=store, task=task))
+        if include_glm_ttt:
+            store = TrajectoryStore(run_name="glm_ttt")
+            all_rows.extend(
+                run_glm_ttt_search(rounds, candidates_per_round, seed=seed, ctx=ctx, store=store, task=task)
+            )
 
     df = append_results(all_rows)
     logger.info("Wrote %d rows to %s", len(all_rows), RUNS_CSV)

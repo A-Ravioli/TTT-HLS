@@ -85,12 +85,23 @@ def estimate_hardware(model: keras.Model, config: BurnConfig) -> dict[str, Any]:
     else:
         bram = max(0, math.ceil(total_weight_bits / (18 * 1024 * 4)))
 
+    # LLM-relevant derived metrics: accumulator width and rough throughput.
+    max_fan_in = max((n_in for n_in, _ in dims), default=1)
+    accum_bits = config.weight_bits + max(1, math.ceil(math.log2(max(2, max_fan_in))))
+    clock_mhz = 200.0  # nominal target Fmax for the estimate
+    latency_cycles = int(round(total_latency))
+    # One token/sample completes every II cycles in a pipelined design.
+    throughput_per_sec = clock_mhz * 1e6 / max(1, max_ii)
+
     return {
-        "latency_cycles": int(round(total_latency)),
+        "latency_cycles": latency_cycles,
         "ii": int(max_ii),
         "dsp": int(total_dsp),
         "lut": int(round(total_lut)),
         "ff": int(round(total_ff)),
         "bram": int(bram),
+        "accum_bits": int(accum_bits),
+        "est_clock_mhz": clock_mhz,
+        "throughput_per_sec": float(round(throughput_per_sec, 1)),
         "estimated": True,
     }

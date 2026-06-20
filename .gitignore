@@ -20,6 +20,11 @@ results/
 *.h5
 *.npy
 
+# GLM trajectory store + LoRA adapters (keep the data/ dir via .gitkeep)
+data/trajectories/
+data/adapters/
+data/*.jsonl
+
 # hls4ml / Vivado / Vitis generated projects and reports
 *_prj/
 myproject*/

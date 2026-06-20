@@ -19,15 +19,20 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from paths import RUNS_CSV  # noqa: E402
-from ttt.reward import BOARD_BUDGET  # noqa: E402
+from ttt.reward import get_board_budget  # noqa: E402
 
 st.set_page_config(page_title="BurnTTT", page_icon="🔥", layout="wide")
 
 METHOD_LABELS = {
     "default": "Default hls4ml",
     "random": "Random search",
-    "burnttt": "BurnTTT (online policy)",
+    "burnttt": "Random forest (baseline)",
+    "glm": "GLM generator (frozen)",
+    "glm_ttt": "GLM generator (test-time finetuned)",
 }
+
+# Methods compared on the reward curve / tables, in plot order.
+COMPARE_METHODS = ("random", "burnttt", "glm", "glm_ttt")
 
 
 @st.cache_data
@@ -45,7 +50,7 @@ def best_row(df: pd.DataFrame) -> pd.Series | None:
 def reward_curve(df: pd.DataFrame) -> pd.DataFrame:
     """Best-reward-so-far per method, aligned on a shared attempt axis."""
     curves = {}
-    for method in ("random", "burnttt"):
+    for method in COMPARE_METHODS:
         sub = df[df["method"] == method].sort_values("attempt")
         if sub.empty:
             continue
@@ -58,25 +63,30 @@ def reward_curve(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> None:
-    st.title("🔥 BurnTTT: Test-Time-Adaptive FPGA Model Burning")
+    st.title("🔥 BurnTTT: a GLM that compiles models onto FPGAs, finetuned at test time")
     st.caption(
-        "A model-to-FPGA compiler that adapts its hardware-generation config at "
-        "**test time** using synthesis/simulation feedback from this exact model + board."
+        "An LLM (GLM) **authors** the model-to-FPGA hardware config and is "
+        "**finetuned at test time** on synthesis/simulation feedback from this exact "
+        "model block + FPGA part. North-star target: Qwen-2B on FPGA."
     )
 
-    with st.expander("What does \"TTT\" mean here? (read me)", expanded=False):
+    with st.expander("What does \"test-time training\" mean here? (read me)", expanded=False):
         st.markdown(
             """
-**BurnTTT does not train the FPGA model after deployment. It adapts the compiler
-at test time before deployment, using simulation and synthesis feedback from the
-specific model and FPGA target.**
+**The deployed FPGA logic is fixed. The test-time training happens in the
+*generator*: GLM's own (LoRA) weights are updated during the run, on feedback
+from this specific (model block, FPGA part) task, so it authors better hardware
+the longer it works on the task.**
 
-The deployed FPGA network is *fixed*. The "test-time training" happens in the
-**compiler loop**: for each new (model, FPGA) pair we treat config selection as a
-fresh task, evaluate candidate configs (quantization error + resource/latency),
-and **train a small surrogate policy online** on that feedback to propose better
-configs. Compare three strategies below: the default hls4ml config, a random
-search, and the BurnTTT online policy — all on an equal evaluation budget.
+For each new task we (1) ask GLM to author a hardware-generation config, (2)
+evaluate it with bit-accurate simulation + synthesis/resource estimation, (3)
+append the feedback, and (4) take a LoRA gradient step on the high-reward
+trajectories. Compare strategies below on an equal evaluation budget: the default
+hls4ml config, random search, the random-forest **baseline**, the **frozen GLM**
+generator, and the **test-time-finetuned GLM** generator.
+
+*(Off-GPU, a heuristic backend stands in for GLM and is adapted analogously, so
+the same climb is demonstrable without weights.)*
             """
         )
 
@@ -131,13 +141,15 @@ search, and the BurnTTT online policy — all on an equal evaluation budget.
                 }
             )
         with right:
+            part = best.get("target_part") if "target_part" in best else None
+            board_budget = get_board_budget(part)
             res_rows = []
-            for field, budget in BOARD_BUDGET.items():
+            for field, budget in board_budget.items():
                 used = best.get(field)
                 used = None if pd.isna(used) else int(used)
                 pct = f"{100 * used / budget:.1f}%" if used is not None else "n/a"
                 res_rows.append({"resource": field.upper(), "used": used, "budget": budget, "utilization": pct})
-            st.markdown("**Resource usage vs PYNQ-Z2 budget**")
+            st.markdown(f"**Resource usage vs board budget** ({part or 'default part'})")
             st.dataframe(pd.DataFrame(res_rows), hide_index=True, use_container_width=True)
 
     # --- Reward over attempts ----------------------------------------------
@@ -155,7 +167,7 @@ search, and the BurnTTT online policy — all on an equal evaluation budget.
     # --- Method comparison table -------------------------------------------
     st.subheader("Method comparison (best valid config per method)")
     comp_rows = []
-    for method in ("default", "random", "burnttt"):
+    for method in ("default", *COMPARE_METHODS):
         sub = df[(df["method"] == method) & (df["compile_success"] == True)]  # noqa: E712
         if sub.empty:
             continue

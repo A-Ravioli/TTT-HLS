@@ -1,0 +1,3 @@
+# Trajectory store lives here (data/trajectories/*.jsonl) and LoRA adapters
+# under data/adapters/. The generated contents are gitignored; this file keeps
+# the directory in version control.

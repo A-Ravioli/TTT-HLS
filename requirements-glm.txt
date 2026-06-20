@@ -1,0 +1,17 @@
+# Optional extras for the REAL GLM generator + test-time LoRA finetuning.
+#
+# Without these, BurnTTT falls back to the deterministic heuristic backend
+# (glm/serving.py) and still runs the full loop. Install on a machine with a GPU
+# and point BURN_GLM_MODEL at GLM weights:
+#
+#   pip install -r requirements-glm.txt
+#   export BURN_GLM_MODEL=THUDM/glm-4-9b-chat
+#
+# Versions are intentionally loose; pin them to whatever your GPU/CUDA stack and
+# chosen GLM checkpoint require.
+
+torch>=2.1
+transformers>=4.44
+peft>=0.11
+accelerate>=0.30
+sentencepiece
