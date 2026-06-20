@@ -270,3 +270,102 @@ class BlockConfig:
         """Build a per-layer config where every layer copies a :class:`BurnConfig`."""
         knobs = LayerKnobs(base.weight_bits, base.activation_bits, base.int_bits, base.reuse_dense_1)
         return cls(layers={name: knobs for name in layer_names}, strategy=base.strategy, io_type=io_type)
+
+
+# ---------------------------------------------------------------------------
+# KernelBundle: the artifact GLM authors in compiler-author mode (Phase 4+)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class KernelBundle:
+    """A complete custom HLS kernel authored/edited by GLM.
+
+    This is the compiler-author mode artifact — replaces BurnConfig/BlockConfig
+    when GLM is authoring Vitis HLS C++ directly instead of hls4ml JSON knobs.
+    """
+
+    sources: dict[str, str]  # filename -> C++/H source content
+    top_function: str = "kernel_top"
+    part: str = "xcu250-figd2104-2l-e"
+    clock_ns: float = 3.3
+
+    # Tile/precision metadata (GLM-authored, used for prompt context)
+    hidden_dim: int = 24
+    intermediate_dim: int = 64
+    weight_bits: int = 16
+    weight_int_bits: int = 6
+    act_bits: int = 16
+    act_int_bits: int = 6
+    tile_hidden: int = 8
+    tile_inter: int = 16
+    axi_width_bits: int = 512
+    double_buffer: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "sources": dict(self.sources),
+            "top_function": self.top_function,
+            "part": self.part,
+            "clock_ns": self.clock_ns,
+            "hidden_dim": self.hidden_dim,
+            "intermediate_dim": self.intermediate_dim,
+            "weight_bits": self.weight_bits,
+            "weight_int_bits": self.weight_int_bits,
+            "act_bits": self.act_bits,
+            "act_int_bits": self.act_int_bits,
+            "tile_hidden": self.tile_hidden,
+            "tile_inter": self.tile_inter,
+            "axi_width_bits": self.axi_width_bits,
+            "double_buffer": self.double_buffer,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "KernelBundle":
+        return cls(
+            sources=dict(d.get("sources", {})),
+            top_function=str(d.get("top_function", "kernel_top")),
+            part=str(d.get("part", "xcu250-figd2104-2l-e")),
+            clock_ns=float(d.get("clock_ns", 3.3)),
+            hidden_dim=int(d.get("hidden_dim", 24)),
+            intermediate_dim=int(d.get("intermediate_dim", 64)),
+            weight_bits=int(d.get("weight_bits", 16)),
+            weight_int_bits=int(d.get("weight_int_bits", 6)),
+            act_bits=int(d.get("act_bits", 16)),
+            act_int_bits=int(d.get("act_int_bits", 6)),
+            tile_hidden=int(d.get("tile_hidden", 8)),
+            tile_inter=int(d.get("tile_inter", 16)),
+            axi_width_bits=int(d.get("axi_width_bits", 512)),
+            double_buffer=bool(d.get("double_buffer", True)),
+        )
+
+    def short_name(self) -> str:
+        return (
+            f"hls_w{self.weight_bits}a{self.act_bits}"
+            f"_h{self.hidden_dim}i{self.intermediate_dim}"
+            f"_t{self.tile_hidden}-{self.tile_inter}"
+        )
+
+    @classmethod
+    def from_block_config(cls, block: BlockConfig, hidden_dim: int, intermediate_dim: int) -> "KernelBundle":
+        """Warm-start a KernelBundle from a Phase-3 BlockConfig."""
+        from compiler.kernel_lib.swiglu_mlp import SwiGLUConfig, generate_full_bundle
+
+        first = next(iter(block.layers.values())) if block.layers else LayerKnobs(16, 16, 6, 1)
+        cfg = SwiGLUConfig(
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            weight_bits=first.weight_bits,
+            weight_int_bits=first.int_bits,
+            act_bits=first.activation_bits,
+            act_int_bits=first.int_bits,
+        )
+        sources = generate_full_bundle(cfg)
+        return cls(
+            sources=sources,
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            weight_bits=first.weight_bits,
+            weight_int_bits=first.int_bits,
+            act_bits=first.activation_bits,
+            act_int_bits=first.int_bits,
+        )
