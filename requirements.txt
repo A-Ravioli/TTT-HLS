@@ -1,0 +1,29 @@
+# BurnTTT MVP dependencies.
+#
+# Pinned to a well-tested stack: TensorFlow 2.14 ships the Keras 2 API, which
+# is hls4ml's most mature conversion path (hls4ml 1.0.0 caps TF at 2.14.1).
+# Use Python 3.10 or 3.11.
+#
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+
+numpy<2.0
+tensorflow==2.14.1
+# hls4ml pulls in QKeras automatically. Pin onnx<1.16 so it stays compatible
+# with the ml_dtypes==0.2.0 that TF 2.14 requires (newer onnx needs float4 dtypes).
+hls4ml==1.0.0
+onnx==1.15.0
+sympy
+scikit-learn>=1.3,<1.6
+pandas>=2.0,<2.3
+streamlit>=1.30,<1.40
+matplotlib>=3.7
+pyyaml
+tabulate
+
+# Dev / tests
+pytest>=7.0
+
+# Optional: only needed on a real PYNQ board for FPGA deployment.
+# Installed automatically on the board's PYNQ image; left commented here.
+# pynq
