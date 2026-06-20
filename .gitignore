@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# BurnTTT generated artifacts
+artifacts/
+build/
+results/
+*.keras
+*.h5
+*.npy
+
+# GLM trajectory store + LoRA adapters (keep the data/ dir via .gitkeep)
+data/trajectories/
+data/adapters/
+data/*.jsonl
+
+# hls4ml / Vivado / Vitis generated projects and reports
+*_prj/
+myproject*/
+hls4ml_prj/
+*.bit
+*.hwh
+*.xclbin
+*.tcl.log
+*.jou
+*.str
+vivado*.log
+vitis*.log
+.Xil/
+
+# Notebooks / OS
+.ipynb_checkpoints/
+.DS_Store
+
+# Streamlit
+.streamlit/secrets.toml
+
+.env
+.env.pod

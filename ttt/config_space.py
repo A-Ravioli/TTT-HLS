@@ -1,0 +1,371 @@
+"""The BurnTTT hardware-configuration search space.
+
+A :class:`BurnConfig` is the unit the autotuner searches over. It captures the
+quantization and HLS knobs that hls4ml exposes and that materially change the
+latency / resource / accuracy tradeoff of the generated accelerator.
+"""
+
+from __future__ import annotations
+
+import random
+from dataclasses import asdict, dataclass
+from typing import Iterable
+
+# Search space (see plan.md section 8).
+BITWIDTHS = [8, 10, 12, 14, 16]
+INT_BITS = [3, 4, 5, 6]
+REUSE_FACTORS = [1, 2, 4, 8, 16]
+STRATEGIES = ["Latency", "Resource"]
+
+# Order matters: this defines the numeric feature vector fed to the policy.
+VECTOR_FIELDS = (
+    "weight_bits",
+    "activation_bits",
+    "int_bits",
+    "reuse_dense_1",
+    "reuse_dense_2",
+    "strategy_latency",
+)
+
+
+@dataclass(frozen=True)
+class BurnConfig:
+    """A single candidate hardware generation config."""
+
+    weight_bits: int
+    activation_bits: int
+    int_bits: int
+    reuse_dense_1: int
+    reuse_dense_2: int
+    strategy: str
+
+    def __post_init__(self) -> None:
+        # int_bits must fit inside the total word length for ap_fixed<W, I>.
+        max_word = max(self.weight_bits, self.activation_bits)
+        if self.int_bits >= max_word:
+            raise ValueError(
+                f"int_bits ({self.int_bits}) must be < total bits ({max_word})"
+            )
+        if self.strategy not in STRATEGIES:
+            raise ValueError(f"strategy must be one of {STRATEGIES}, got {self.strategy}")
+
+    # -- precision strings -------------------------------------------------
+    def weight_precision(self) -> str:
+        return f"ap_fixed<{self.weight_bits},{self.int_bits}>"
+
+    def activation_precision(self) -> str:
+        return f"ap_fixed<{self.activation_bits},{self.int_bits}>"
+
+    # -- serialization -----------------------------------------------------
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BurnConfig":
+        return cls(
+            weight_bits=int(d["weight_bits"]),
+            activation_bits=int(d["activation_bits"]),
+            int_bits=int(d["int_bits"]),
+            reuse_dense_1=int(d["reuse_dense_1"]),
+            reuse_dense_2=int(d["reuse_dense_2"]),
+            strategy=str(d["strategy"]),
+        )
+
+    def to_vector(self) -> list[float]:
+        """Numeric feature vector consumed by the online policy."""
+        return [
+            float(self.weight_bits),
+            float(self.activation_bits),
+            float(self.int_bits),
+            float(self.reuse_dense_1),
+            float(self.reuse_dense_2),
+            1.0 if self.strategy == "Latency" else 0.0,
+        ]
+
+    def short_name(self) -> str:
+        return (
+            f"w{self.weight_bits}a{self.activation_bits}i{self.int_bits}"
+            f"_r{self.reuse_dense_1}-{self.reuse_dense_2}_{self.strategy[:3]}"
+        )
+
+
+def config_to_vector(config: BurnConfig) -> list[float]:
+    return config.to_vector()
+
+
+def random_config(rng: random.Random | None = None) -> BurnConfig:
+    """Sample one valid random config (retries until int_bits constraint holds)."""
+    r = rng or random
+    while True:
+        bits = r.choice(BITWIDTHS)
+        int_bits = r.choice([b for b in INT_BITS if b < bits] or [3])
+        try:
+            return BurnConfig(
+                weight_bits=bits,
+                activation_bits=bits,
+                int_bits=int_bits,
+                reuse_dense_1=r.choice(REUSE_FACTORS),
+                reuse_dense_2=r.choice(REUSE_FACTORS),
+                strategy=r.choice(STRATEGIES),
+            )
+        except ValueError:
+            continue
+
+
+def sample_random_configs(n: int, rng: random.Random | None = None) -> list[BurnConfig]:
+    """Sample ``n`` distinct-ish random configs."""
+    return [random_config(rng) for _ in range(n)]
+
+
+def seed_configs() -> list[BurnConfig]:
+    """Hand-picked seed configs spanning the accuracy/resource spectrum.
+
+    These mirror the manual A/B/C/D configs in plan.md section 5 and give the
+    surrogate policy a diverse warm start. Six points (>= the fit threshold) let
+    the policy learn the resource/accuracy boundary from round 1.
+    """
+    return [
+        BurnConfig(16, 16, 6, 1, 1, "Latency"),  # high precision, fast, over-budget cliff
+        BurnConfig(14, 14, 4, 2, 2, "Latency"),  # over-budget
+        BurnConfig(12, 12, 4, 8, 8, "Resource"),  # fits, mid region (good basin start)
+        BurnConfig(10, 10, 3, 16, 8, "Resource"),  # fits, lower precision
+        BurnConfig(8, 8, 3, 16, 16, "Resource"),  # low precision, light, fits easily
+        BurnConfig(14, 14, 5, 4, 4, "Resource"),  # borderline resources
+    ]
+
+
+def _adjacent(grid: list[int], value: int) -> list[int]:
+    """Neighboring values one step away in a discrete grid."""
+    if value not in grid:
+        return grid[:1]
+    i = grid.index(value)
+    out = []
+    if i > 0:
+        out.append(grid[i - 1])
+    if i < len(grid) - 1:
+        out.append(grid[i + 1])
+    return out
+
+
+def neighbors(config: BurnConfig) -> list[BurnConfig]:
+    """Single-step mutations of ``config`` for local exploitation.
+
+    Varies one knob at a time (bit level, int bits, each reuse factor, strategy)
+    while keeping weight/activation bitwidths tied, as in :func:`random_config`.
+    """
+    out: list[BurnConfig] = []
+    bits = config.weight_bits
+
+    def _try(**overrides) -> None:
+        params = config.to_dict()
+        params.update(overrides)
+        try:
+            out.append(BurnConfig.from_dict(params))
+        except ValueError:
+            pass
+
+    for nb in _adjacent(BITWIDTHS, bits):
+        ib = config.int_bits if config.int_bits < nb else nb - 1
+        _try(weight_bits=nb, activation_bits=nb, int_bits=ib)
+    for nib in _adjacent(INT_BITS, config.int_bits):
+        if nib < bits:
+            _try(int_bits=nib)
+    for nr in _adjacent(REUSE_FACTORS, config.reuse_dense_1):
+        _try(reuse_dense_1=nr)
+    for nr in _adjacent(REUSE_FACTORS, config.reuse_dense_2):
+        _try(reuse_dense_2=nr)
+    _try(strategy="Resource" if config.strategy == "Latency" else "Latency")
+
+    # Dedupe, dropping the original.
+    seen = {config.short_name()}
+    unique = []
+    for c in out:
+        if c.short_name() not in seen:
+            seen.add(c.short_name())
+            unique.append(c)
+    return unique
+
+
+def all_field_names() -> Iterable[str]:
+    return VECTOR_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# Richer, per-layer config artifact (for multi-layer blocks like Qwen's MLP)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LayerKnobs:
+    """Per-layer quantization + reuse knobs."""
+
+    weight_bits: int
+    activation_bits: int
+    int_bits: int
+    reuse: int
+
+    def __post_init__(self) -> None:
+        if self.int_bits >= max(self.weight_bits, self.activation_bits):
+            raise ValueError(
+                f"int_bits ({self.int_bits}) must be < total bits "
+                f"({max(self.weight_bits, self.activation_bits)})"
+            )
+
+    def weight_precision(self) -> str:
+        return f"ap_fixed<{self.weight_bits},{self.int_bits}>"
+
+    def activation_precision(self) -> str:
+        return f"ap_fixed<{self.activation_bits},{self.int_bits}>"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LayerKnobs":
+        return cls(
+            weight_bits=int(d["weight_bits"]),
+            activation_bits=int(d["activation_bits"]),
+            int_bits=int(d["int_bits"]),
+            reuse=int(d["reuse"]),
+        )
+
+
+@dataclass(frozen=True)
+class BlockConfig:
+    """A per-layer hardware config for a multi-layer block.
+
+    Generalizes :class:`BurnConfig` (which ties all layers to one precision/reuse
+    pair) so the GLM can author distinct precision/reuse per layer plus block-wide
+    strategy and IO/dataflow mode -- the knobs that matter once a block has many
+    differently-shaped matmuls (e.g. Qwen's gate/up/down projections).
+    """
+
+    layers: dict[str, LayerKnobs]
+    strategy: str = "Resource"
+    io_type: str = "io_stream"
+
+    def __post_init__(self) -> None:
+        if self.strategy not in STRATEGIES:
+            raise ValueError(f"strategy must be one of {STRATEGIES}, got {self.strategy}")
+        if self.io_type not in ("io_parallel", "io_stream"):
+            raise ValueError(f"io_type must be io_parallel|io_stream, got {self.io_type}")
+
+    def to_dict(self) -> dict:
+        return {
+            "layers": {name: k.to_dict() for name, k in self.layers.items()},
+            "strategy": self.strategy,
+            "io_type": self.io_type,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BlockConfig":
+        layers = {name: LayerKnobs.from_dict(k) for name, k in d.get("layers", {}).items()}
+        return cls(
+            layers=layers,
+            strategy=str(d.get("strategy", "Resource")),
+            io_type=str(d.get("io_type", "io_stream")),
+        )
+
+    @classmethod
+    def uniform(cls, layer_names: list[str], base: BurnConfig, io_type: str = "io_stream") -> "BlockConfig":
+        """Build a per-layer config where every layer copies a :class:`BurnConfig`."""
+        knobs = LayerKnobs(base.weight_bits, base.activation_bits, base.int_bits, base.reuse_dense_1)
+        return cls(layers={name: knobs for name in layer_names}, strategy=base.strategy, io_type=io_type)
+
+
+# ---------------------------------------------------------------------------
+# KernelBundle: the artifact GLM authors in compiler-author mode (Phase 4+)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class KernelBundle:
+    """A complete custom HLS kernel authored/edited by GLM.
+
+    This is the compiler-author mode artifact — replaces BurnConfig/BlockConfig
+    when GLM is authoring Vitis HLS C++ directly instead of hls4ml JSON knobs.
+    """
+
+    sources: dict[str, str]  # filename -> C++/H source content
+    top_function: str = "kernel_top"
+    part: str = "xcu250-figd2104-2l-e"
+    clock_ns: float = 3.3
+
+    # Tile/precision metadata (GLM-authored, used for prompt context)
+    hidden_dim: int = 24
+    intermediate_dim: int = 64
+    weight_bits: int = 16
+    weight_int_bits: int = 6
+    act_bits: int = 16
+    act_int_bits: int = 6
+    tile_hidden: int = 8
+    tile_inter: int = 16
+    axi_width_bits: int = 512
+    double_buffer: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "sources": dict(self.sources),
+            "top_function": self.top_function,
+            "part": self.part,
+            "clock_ns": self.clock_ns,
+            "hidden_dim": self.hidden_dim,
+            "intermediate_dim": self.intermediate_dim,
+            "weight_bits": self.weight_bits,
+            "weight_int_bits": self.weight_int_bits,
+            "act_bits": self.act_bits,
+            "act_int_bits": self.act_int_bits,
+            "tile_hidden": self.tile_hidden,
+            "tile_inter": self.tile_inter,
+            "axi_width_bits": self.axi_width_bits,
+            "double_buffer": self.double_buffer,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "KernelBundle":
+        return cls(
+            sources=dict(d.get("sources", {})),
+            top_function=str(d.get("top_function", "kernel_top")),
+            part=str(d.get("part", "xcu250-figd2104-2l-e")),
+            clock_ns=float(d.get("clock_ns", 3.3)),
+            hidden_dim=int(d.get("hidden_dim", 24)),
+            intermediate_dim=int(d.get("intermediate_dim", 64)),
+            weight_bits=int(d.get("weight_bits", 16)),
+            weight_int_bits=int(d.get("weight_int_bits", 6)),
+            act_bits=int(d.get("act_bits", 16)),
+            act_int_bits=int(d.get("act_int_bits", 6)),
+            tile_hidden=int(d.get("tile_hidden", 8)),
+            tile_inter=int(d.get("tile_inter", 16)),
+            axi_width_bits=int(d.get("axi_width_bits", 512)),
+            double_buffer=bool(d.get("double_buffer", True)),
+        )
+
+    def short_name(self) -> str:
+        return (
+            f"hls_w{self.weight_bits}a{self.act_bits}"
+            f"_h{self.hidden_dim}i{self.intermediate_dim}"
+            f"_t{self.tile_hidden}-{self.tile_inter}"
+        )
+
+    @classmethod
+    def from_block_config(cls, block: BlockConfig, hidden_dim: int, intermediate_dim: int) -> "KernelBundle":
+        """Warm-start a KernelBundle from a Phase-3 BlockConfig."""
+        from compiler.kernel_lib.swiglu_mlp import SwiGLUConfig, generate_full_bundle
+
+        first = next(iter(block.layers.values())) if block.layers else LayerKnobs(16, 16, 6, 1)
+        cfg = SwiGLUConfig(
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            weight_bits=first.weight_bits,
+            weight_int_bits=first.int_bits,
+            act_bits=first.activation_bits,
+            act_int_bits=first.int_bits,
+        )
+        sources = generate_full_bundle(cfg)
+        return cls(
+            sources=sources,
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            weight_bits=first.weight_bits,
+            weight_int_bits=first.int_bits,
+            act_bits=first.activation_bits,
+            act_int_bits=first.int_bits,
+        )
