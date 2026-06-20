@@ -1,0 +1,8 @@
+# Large generated artifacts -- regenerate with export_weights.py / make_golden.py
+weights/
+golden/
+build/
+gemv_int4_prj/
+*.so
+*.dylib
+*.o

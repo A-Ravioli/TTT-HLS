@@ -48,3 +48,5 @@ vitis*.log
 
 .env
 .env.pod
+etched-hack.pem
+*.pem
