@@ -35,6 +35,20 @@ from ttt.reward import get_board_budget
 logger = get_logger("burnttt.scripts.glm_author_hls")
 
 
+def _train_row(result: dict, sources: dict[str, str], method: str, round_idx: int) -> dict:
+    """A history row that also carries the kernel sources + provenance.
+
+    The TTT trainer mines SFT/DPO examples from these, so the sources (and the
+    method/round used for repair-pair mining) must travel with the metrics --
+    the metric-only rows from ``result_to_hls_history_row`` left the corpus empty.
+    """
+    row = result_to_hls_history_row(result)
+    row["sources"] = sources
+    row["method"] = method
+    row["round_idx"] = round_idx
+    return row
+
+
 def main():
     parser = argparse.ArgumentParser(description="GLM HLS author loop with TTT")
     parser.add_argument("--rounds", type=int, default=6, help="Number of propose/repair rounds")
@@ -70,8 +84,17 @@ def main():
     model, _ = build_mlp_keras(arch, args.tile_div)
     golden = generate_golden_from_keras(model, n_samples=64)
 
+    # Extract the golden's projection matrices so every authored kernel bakes the
+    # SAME weights (via weights.h) -- otherwise cosim compares the golden against a
+    # zero-weight kernel and can never pass.
+    weights = {
+        "gate_w": model.get_layer("gate_proj").get_weights()[0],
+        "up_w": model.get_layer("up_proj").get_weights()[0],
+        "down_w": model.get_layer("down_proj").get_weights()[0],
+    }
+
     # Initialize agent and trainer
-    agent = GLMCompilerAgent(seed=args.seed)
+    agent = GLMCompilerAgent(seed=args.seed, weights=weights)
     method = "glm_hls_ttt" if not args.no_ttt else "glm_hls"
     trainer = None
     if not args.no_ttt:
@@ -85,7 +108,7 @@ def main():
 
     # Seed bundle
     seed_cfg = SwiGLUConfig(hidden_dim=dims.hidden, intermediate_dim=dims.intermediate)
-    seed_sources = generate_full_bundle(seed_cfg)
+    seed_sources = generate_full_bundle(seed_cfg, weights=weights)
     seed_bundle = KernelBundle(
         sources=seed_sources,
         hidden_dim=dims.hidden,
@@ -94,7 +117,8 @@ def main():
     )
 
     # Main loop
-    history: list[dict] = []
+    history: list[dict] = []      # metric-only rows for the agent's propose context
+    train_rows: list[dict] = []   # rows WITH sources, for the TTT trainer's corpus
     best_result: dict | None = None
     best_bundle: KernelBundle | None = None
 
@@ -118,6 +142,7 @@ def main():
             cleanup=False,
         )
         history.append(result_to_hls_history_row(result))
+        train_rows.append(_train_row(result, bundle.sources, method, r))
         store.append(
             task_name=task.name,
             kernel_name=bundle.short_name(),
@@ -147,7 +172,11 @@ def main():
                     max_error_threshold=args.max_error,
                     cleanup=False,
                 )
+                # Advance to the repaired artifact so the next attempt edits *this*
+                # one (with its fresh error), not the original broken bundle again.
+                bundle = repaired
                 history.append(result_to_hls_history_row(result))
+                train_rows.append(_train_row(result, repaired.sources, f"{method}_repair", r))
                 store.append(
                     task_name=task.name,
                     kernel_name=repaired.short_name(),
@@ -160,7 +189,6 @@ def main():
                     best_result = result
                     best_bundle = repaired
                 if result.get("cosim_pass"):
-                    bundle = repaired
                     break
 
         # Iterate on passing kernel
@@ -174,6 +202,7 @@ def main():
                     cleanup=False,
                 )
                 history.append(result_to_hls_history_row(iter_result))
+                train_rows.append(_train_row(iter_result, improved.sources, f"{method}_iterate", r))
                 store.append(
                     task_name=task.name,
                     kernel_name=improved.short_name(),
@@ -186,9 +215,9 @@ def main():
                     best_result = iter_result
                     best_bundle = improved
 
-        # TTT step
-        if trainer is not None and len(history) >= 2:
-            ttt_info = trainer.step(history, round_idx=r)
+        # TTT step (train on rows that carry the kernel sources, not metrics only)
+        if trainer is not None and len(train_rows) >= 2:
+            ttt_info = trainer.step(train_rows, round_idx=r)
             wandb_run.log_ttt_step(len(history), ttt_info)
             logger.info("TTT step: %s", ttt_info)
 

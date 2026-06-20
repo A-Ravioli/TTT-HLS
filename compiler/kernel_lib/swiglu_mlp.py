@@ -17,6 +17,9 @@ specific (hidden_dim, intermediate_dim, FPGA part) target.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
 
 
 @dataclass
@@ -65,32 +68,42 @@ void kernel_top(const io_t input[HIDDEN_DIM], io_t output[HIDDEN_DIM]);
 """
 
 
-def generate_kernel_source(cfg: SwiGLUConfig) -> str:
-    """Generate the kernel_top.cpp implementation."""
+def generate_kernel_source(cfg: SwiGLUConfig, with_weights: bool = False) -> str:
+    """Generate the kernel_top.cpp implementation.
+
+    When ``with_weights`` is True the weight arrays come from a generated
+    ``weights.h`` (baked from the golden model) so C/RTL cosim is a real numeric
+    check. Otherwise they are zero-initialized statics -- fine for structure /
+    resource estimation, but cosim against a non-trivial golden will fail.
+    """
+    if with_weights:
+        weight_block = (
+            '// Weights baked from the golden model (weights.h) so cosim is a real\n'
+            "// numeric comparison rather than a check against zero-filled arrays.\n"
+            '#include "weights.h"'
+        )
+    else:
+        weight_block = (
+            "// Weight storage (in real deployment these come via AXI from DDR)\n"
+            "static weight_t gate_w[HIDDEN_DIM][INTER_DIM];\n"
+            "static weight_t up_w[HIDDEN_DIM][INTER_DIM];\n"
+            "static weight_t down_w[INTER_DIM][HIDDEN_DIM];"
+        )
     return f"""\
 #include "kernel_top.h"
 #include <cmath>
 
-// Weight storage (in real deployment these come via AXI from DDR)
-static weight_t gate_w[HIDDEN_DIM][INTER_DIM];
-static weight_t up_w[HIDDEN_DIM][INTER_DIM];
-static weight_t down_w[INTER_DIM][HIDDEN_DIM];
+{weight_block}
 
 // SiLU activation: x * sigmoid(x)
 static act_t silu(act_t x) {{
     #pragma HLS INLINE
-    // Piecewise linear approximation for HLS-friendly sigmoid
-    act_t abs_x = (x > 0) ? x : (act_t)(-x);
-    act_t sig;
-    if (abs_x > (act_t)4.0) {{
-        sig = (x > 0) ? (act_t)1.0 : (act_t)0.0;
-    }} else {{
-        // Linear approximation: sigmoid(x) ~ 0.5 + 0.25*x for |x| < 4
-        sig = (act_t)0.5 + (act_t)0.197 * x;
-        if (sig > (act_t)1.0) sig = (act_t)1.0;
-        if (sig < (act_t)0.0) sig = (act_t)0.0;
-    }}
-    return x * sig;
+    // Exact sigmoid in float; matches the golden's swish to within the
+    // fixed-point quantization that cosim is meant to measure (the old
+    // piecewise-linear approximation diverged from the golden by construction).
+    float xf = (float)x;
+    float sig = 1.0f / (1.0f + expf(-xf));
+    return (act_t)(xf * sig);
 }}
 
 void kernel_top(const io_t input[HIDDEN_DIM], io_t output[HIDDEN_DIM]) {{
@@ -214,12 +227,64 @@ int main() {{
 """
 
 
-def generate_full_bundle(cfg: SwiGLUConfig) -> dict[str, str]:
+def _format_c_matrix(arr: np.ndarray) -> str:
+    """Render a 2-D array as a C99 brace-enclosed initializer list."""
+    rows = ["    {" + ", ".join(f"{float(v):.8g}" for v in row) + "}" for row in arr]
+    return "{\n" + ",\n".join(rows) + "\n}"
+
+
+def generate_weights_header(cfg: SwiGLUConfig, weights: dict[str, Any]) -> str:
+    """Emit ``weights.h`` baking the golden model's projection matrices.
+
+    ``weights`` maps ``gate_w``/``up_w``/``down_w`` to 2-D arrays shaped
+    ``(hidden, inter)``, ``(hidden, inter)`` and ``(inter, hidden)`` respectively
+    -- exactly the Keras ``Dense`` kernels (``y = x @ W``) the golden was built
+    from, so the kernel computes the same function.
+    """
+    gate_w = np.asarray(weights["gate_w"], dtype=float)
+    up_w = np.asarray(weights["up_w"], dtype=float)
+    down_w = np.asarray(weights["down_w"], dtype=float)
+
+    expected = {
+        "gate_w": (cfg.hidden_dim, cfg.intermediate_dim),
+        "up_w": (cfg.hidden_dim, cfg.intermediate_dim),
+        "down_w": (cfg.intermediate_dim, cfg.hidden_dim),
+    }
+    for name, arr in (("gate_w", gate_w), ("up_w", up_w), ("down_w", down_w)):
+        if arr.shape != expected[name]:
+            raise ValueError(
+                f"{name} has shape {arr.shape}, expected {expected[name]} "
+                f"for hidden={cfg.hidden_dim}, inter={cfg.intermediate_dim}"
+            )
+
+    return f"""\
+#ifndef WEIGHTS_H
+#define WEIGHTS_H
+
+#include "kernel_top.h"
+
+// Auto-generated from the golden model; do not edit by hand.
+static const weight_t gate_w[HIDDEN_DIM][INTER_DIM] = {_format_c_matrix(gate_w)};
+
+static const weight_t up_w[HIDDEN_DIM][INTER_DIM] = {_format_c_matrix(up_w)};
+
+static const weight_t down_w[INTER_DIM][HIDDEN_DIM] = {_format_c_matrix(down_w)};
+
+#endif // WEIGHTS_H
+"""
+
+
+def generate_full_bundle(cfg: SwiGLUConfig, weights: dict[str, Any] | None = None) -> dict[str, str]:
     """Generate all source files for the SwiGLU kernel bundle.
 
-    Returns a dict of {filename: content} suitable for KernelBundle.sources.
+    Returns a dict of {filename: content} suitable for KernelBundle.sources. When
+    ``weights`` is given, a ``weights.h`` is emitted and the kernel uses it so
+    cosim against the golden is a real numeric check.
     """
-    return {
+    sources = {
         "kernel_top.h": generate_kernel_header(cfg),
-        "kernel_top.cpp": generate_kernel_source(cfg),
+        "kernel_top.cpp": generate_kernel_source(cfg, with_weights=weights is not None),
     }
+    if weights is not None:
+        sources["weights.h"] = generate_weights_header(cfg, weights)
+    return sources

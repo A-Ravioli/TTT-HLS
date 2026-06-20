@@ -75,6 +75,39 @@ def test_success_with_zero_tps():
     assert r < 0  # penalty from max_error
 
 
+def test_reward_scale_is_sane_not_astronomical():
+    # log-scaled throughput keeps the reward in a sane range even at realistic
+    # tokens/sec (used to be ~1e8 with the literal 1000*tps, dwarfing penalties).
+    result = {
+        "hls_compile_success": True,
+        "cosim_pass": True,
+        "timing_met": True,
+        "max_error": 0.001,
+        "max_error_threshold": 0.01,
+        "tokens_per_sec": 1e5,
+        "power_w": 0.0,
+    }
+    assert 0 < reward_hls(result) < 1e5
+
+
+def test_over_budget_beats_marginal_speedup():
+    # A faster-but-over-budget kernel must NOT outrank a slightly slower in-budget
+    # one. With the old 1000*tps reward the over-budget penalty was negligible.
+    over = {
+        "hls_compile_success": True,
+        "cosim_pass": True,
+        "timing_met": True,
+        "max_error": 0.001,
+        "max_error_threshold": 0.01,
+        "tokens_per_sec": 1.0e5,
+        "power_w": 0.0,
+        "part": "xc7z020clg400-1",  # 220 DSPs
+        "dsp": 500,                 # over budget
+    }
+    in_budget = {**over, "tokens_per_sec": 9.0e4, "dsp": 100}
+    assert reward_hls(in_budget) > reward_hls(over)
+
+
 def test_over_budget_penalty():
     result = {
         "hls_compile_success": True,

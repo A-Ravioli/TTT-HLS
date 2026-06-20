@@ -84,6 +84,15 @@ def load_qwen_arch(model_id: str = DEFAULT_MODEL_ID) -> QwenArch:
         return QwenArch(model_id=model_id, **QWEN_SPECS[model_id])
 
 
+def get_default_arch() -> QwenArch:
+    """Convenience wrapper: the :class:`QwenArch` for :data:`DEFAULT_MODEL_ID`.
+
+    The Phase-4 HLS scripts (``10``--``14``) import this; keep it as a thin alias
+    over :func:`load_qwen_arch` so they share one source of truth for the default.
+    """
+    return load_qwen_arch(DEFAULT_MODEL_ID)
+
+
 def load_qwen_model(model_id: str = DEFAULT_MODEL_ID):
     """Load the actual Qwen2 weights (requires transformers + torch)."""
     from transformers import AutoModelForCausalLM

@@ -12,7 +12,6 @@ Pure stdlib; consumed by :mod:`glm.finetune.trainer`.
 from __future__ import annotations
 
 import json
-import statistics
 from dataclasses import dataclass
 from typing import Any
 
@@ -83,15 +82,16 @@ def to_sft_examples(
     compiled = [r for r in rows if _valid_config(r, threshold)]
     if not compiled:
         return []
-    rewards = [float(r["reward"]) for r in compiled]
-    cutoff = statistics.median(rewards) if len(rewards) > 1 else min(rewards) - 1
+    # Keep configs at or above the top-``top_frac`` reward cutoff (always >= 1).
+    rewards = sorted((float(r["reward"]) for r in compiled), reverse=True)
+    cutoff_idx = max(1, int(len(rewards) * top_frac))
+    cutoff = rewards[min(cutoff_idx, len(rewards) - 1)]
     prompt = build_propose_prompt(task.describe(), [], 1)
     examples = []
     for r in sorted(compiled, key=lambda x: float(x["reward"]), reverse=True):
         if float(r["reward"]) >= cutoff:
             examples.append(SFTExample(SYSTEM_PROMPT, prompt, _completion(r["config"])))
-    keep = max(1, int(len(examples) * 1.0))
-    return examples[:keep]
+    return examples
 
 
 def to_preference_pairs(

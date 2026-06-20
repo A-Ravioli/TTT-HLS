@@ -143,6 +143,13 @@ class TestTimeTrainer:
         sft_losses: list[float] = []
         dpo_losses: list[float] = []
 
+        # dpo_weight trades off the two objectives; when only one is present it
+        # gets the full step (the weight only splits a combined SFT+DPO update).
+        do_dpo = bool(self.use_dpo and pref_pairs)
+        both = bool(examples) and do_dpo
+        sft_scale = (1.0 - self.dpo_weight) if both else 1.0
+        dpo_scale = self.dpo_weight if both else 1.0
+
         for _ in range(self.steps_per_round):
             ran = False
             self._optimizer.zero_grad()
@@ -151,12 +158,12 @@ class TestTimeTrainer:
                 for ex in examples:
                     input_ids, labels = self._encode(tok, ex, device)
                     out = model(input_ids=input_ids, labels=labels)
-                    (out.loss / len(examples)).backward()
+                    (out.loss * sft_scale / len(examples)).backward()
                     total += float(out.loss.detach())
                 sft_losses.append(total / len(examples))
                 ran = True
 
-            if self.use_dpo and pref_pairs:
+            if do_dpo:
                 import torch
 
                 n = min(4, len(pref_pairs))
@@ -171,7 +178,7 @@ class TestTimeTrainer:
                             ref_r = -float(self._nll(model, tok, pair.system, pair.prompt, pair.rejected, device))
                     logit = self.dpo_beta * ((pi_c - pi_r) - (ref_c - ref_r))
                     loss = -torch.nn.functional.logsigmoid(logit)
-                    (loss / n).backward()
+                    (loss * dpo_scale / n).backward()
                     dpo_total += float(loss.detach())
                 dpo_losses.append(dpo_total / n)
                 ran = True
@@ -217,7 +224,12 @@ class TestTimeTrainer:
         prompt_ids = tok(prompt_text, return_tensors="pt").input_ids[0]
         labels = full_ids.clone()
         labels[:, : min(len(prompt_ids), labels.shape[1])] = -100
-        return model(input_ids=full_ids, labels=labels).loss
+        # DPO compares sequence log-probabilities, so return the *summed* NLL over
+        # the completion tokens rather than HF's length-normalized mean -- otherwise
+        # the preference signal is confounded by chosen/rejected length differences.
+        out = model(input_ids=full_ids, labels=labels)
+        n_tok = (labels != -100).sum().clamp(min=1)
+        return out.loss * n_tok
 
     def _encode(self, tok, ex, device):
         prompt_text = tok.apply_chat_template(

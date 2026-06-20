@@ -22,7 +22,7 @@ from glm.prompts.hls_templates import (
 )
 from glm.serving import GLMBackend, load_backend, llm_generate
 from glm.tasks import FpgaTask
-from compiler.kernel_lib.swiglu_mlp import SwiGLUConfig, generate_full_bundle
+from compiler.kernel_lib.swiglu_mlp import SwiGLUConfig, generate_full_bundle, generate_weights_header
 from paths import get_logger
 from ttt.config_space import KernelBundle
 
@@ -58,10 +58,14 @@ class GLMCompilerAgent:
         backend: GLMBackend | None = None,
         seed: int = 0,
         max_repair_attempts: int = 3,
+        weights: dict[str, Any] | None = None,
     ):
         self.backend = backend or load_backend()
         self._rng = random.Random(seed)
         self.max_repair_attempts = max_repair_attempts
+        # Golden projection matrices baked into every kernel so cosim is a real
+        # numeric check. When None, kernels fall back to zero-init weight storage.
+        self._weights = weights
 
     @property
     def backend_name(self) -> str:
@@ -120,6 +124,20 @@ class GLMCompilerAgent:
 
     # -- LLM paths ----------------------------------------------------------
 
+    def _attach_weights(self, sources: dict[str, str], hidden_dim: int, intermediate_dim: int) -> dict[str, str]:
+        """Bake the real golden weights.h into an LLM-authored bundle.
+
+        The model is told (via the prompt) to ``#include "weights.h"``; we supply
+        the actual values here so its kernel computes the golden function. No-op
+        when this agent has no weights.
+        """
+        if not self._weights:
+            return sources
+        cfg = SwiGLUConfig(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim)
+        out = dict(sources)
+        out["weights.h"] = generate_weights_header(cfg, self._weights)
+        return out
+
     def _propose_llm(self, task, history, hidden_dim, intermediate_dim, seed_bundle):
         seed_src = None
         if seed_bundle:
@@ -133,13 +151,14 @@ class GLMCompilerAgent:
             intermediate_dim=intermediate_dim,
             seed_template=seed_src,
             history=history,
+            weights_provided=self._weights is not None,
         )
         texts = self._generate(prompt)
         for text in texts:
             parsed = parse_hls_from_text(text)
             if parsed.success:
                 return KernelBundle(
-                    sources=parsed.sources,
+                    sources=self._attach_weights(parsed.sources, hidden_dim, intermediate_dim),
                     hidden_dim=hidden_dim,
                     intermediate_dim=intermediate_dim,
                     part=task.target_part,
@@ -155,13 +174,14 @@ class GLMCompilerAgent:
             current_source=current_src,
             error_msg=result.get("error_msg", ""),
             error_type=error_type,
+            weights_provided=self._weights is not None,
         )
         texts = self._generate(prompt)
         for text in texts:
             parsed = parse_hls_from_text(text)
             if parsed.success:
                 return KernelBundle(
-                    sources=parsed.sources,
+                    sources=self._attach_weights(parsed.sources, bundle.hidden_dim, bundle.intermediate_dim),
                     hidden_dim=bundle.hidden_dim,
                     intermediate_dim=bundle.intermediate_dim,
                     part=bundle.part,
@@ -183,7 +203,7 @@ class GLMCompilerAgent:
             parsed = parse_hls_from_text(text)
             if parsed.success:
                 return KernelBundle(
-                    sources=parsed.sources,
+                    sources=self._attach_weights(parsed.sources, bundle.hidden_dim, bundle.intermediate_dim),
                     hidden_dim=bundle.hidden_dim,
                     intermediate_dim=bundle.intermediate_dim,
                     part=bundle.part,
@@ -203,7 +223,7 @@ class GLMCompilerAgent:
 
         # Vary precision and tiling based on what worked/failed
         cfg = self._pick_config_from_history(history, hidden_dim, intermediate_dim)
-        sources = generate_full_bundle(cfg)
+        sources = generate_full_bundle(cfg, weights=self._weights)
         return KernelBundle(
             sources=sources,
             hidden_dim=hidden_dim,
@@ -259,7 +279,7 @@ class GLMCompilerAgent:
                 tile_inter=4,
             )
 
-        sources = generate_full_bundle(cfg)
+        sources = generate_full_bundle(cfg, weights=self._weights)
         return KernelBundle(
             sources=sources,
             hidden_dim=bundle.hidden_dim,
@@ -297,7 +317,7 @@ class GLMCompilerAgent:
             tile_hidden=new_tile_h,
             tile_inter=new_tile_i,
         )
-        sources = generate_full_bundle(cfg)
+        sources = generate_full_bundle(cfg, weights=self._weights)
         return KernelBundle(
             sources=sources,
             hidden_dim=bundle.hidden_dim,
@@ -353,7 +373,7 @@ class GLMCompilerAgent:
 
     def _seed_bundle(self, hidden_dim, intermediate_dim, part) -> KernelBundle:
         cfg = SwiGLUConfig(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim)
-        sources = generate_full_bundle(cfg)
+        sources = generate_full_bundle(cfg, weights=self._weights)
         return KernelBundle(
             sources=sources,
             hidden_dim=hidden_dim,

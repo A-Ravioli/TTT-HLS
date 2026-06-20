@@ -7,6 +7,7 @@ Soft penalties: power, BRAM usage.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from paths import get_logger
@@ -17,6 +18,12 @@ logger = get_logger("burnttt.reward_hls")
 # Accuracy threshold for cosim (tighter than config mode)
 HLS_MAX_ERROR_THRESHOLD = 0.01
 
+# Throughput weight. tokens/sec spans many orders of magnitude (1e3..1e6), so we
+# score it on a log scale instead of plan.md's literal ``1000 * tps`` -- otherwise
+# the raw product (~1e8) dwarfs every penalty below and the over-budget / accuracy
+# constraints become rounding error in the ranking.
+THROUGHPUT_WEIGHT = 1000.0
+
 
 def reward_hls(result: dict[str, Any]) -> float:
     """Compute the scalar reward for an HLS evaluation result.
@@ -25,7 +32,7 @@ def reward_hls(result: dict[str, Any]) -> float:
     - Compile failure: -1000
     - Cosim failure: -800 - 100 * max_error
     - Timing failure: -600 - 10 * WNS violation
-    - Success: 1000 * tokens_per_sec - penalties
+    - Success: THROUGHPUT_WEIGHT * log10(1 + tokens_per_sec) - penalties
     """
     # Gate 1: HLS compile
     if not result.get("hls_compile_success"):
@@ -47,11 +54,11 @@ def reward_hls(result: dict[str, Any]) -> float:
     if max_err > threshold:
         return -500.0 - 100.0 * max_err
 
-    # Success: primary reward is throughput
+    # Success: primary reward is throughput (log-scaled so penalties stay relevant)
     tps = safe(result.get("tokens_per_sec"), default=0.0)
     power = safe(result.get("power_w"), default=0.0)
 
-    score = 1000.0 * tps - 0.01 * power - 50.0 * max_err
+    score = THROUGHPUT_WEIGHT * math.log10(1.0 + max(0.0, tps)) - 0.01 * power - 50.0 * max_err
 
     # Over-budget penalties
     budget = get_board_budget(result.get("part"))

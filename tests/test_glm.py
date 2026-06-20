@@ -96,6 +96,9 @@ def test_adapt_increases_exploitation():
 def test_load_backend_defaults_to_heuristic(monkeypatch):
     monkeypatch.delenv("BURN_GLM_MODEL", raising=False)
     monkeypatch.delenv("BURN_GLM_BACKEND", raising=False)
+    # Also clear the Prime key, else a real key in the dev .env makes the default
+    # backend "prime" and this test (which asserts the no-config default) fails.
+    monkeypatch.delenv("PRIME_API_KEY", raising=False)
     assert load_backend().name == "heuristic"
 
 

@@ -52,11 +52,13 @@ def build_mlp_keras(arch: QwenArch, tile_div: int = 64, seed: int = 0):
     )
     init = keras.initializers.GlorotUniform(seed=seed)
     inputs = keras.Input(shape=(dims.hidden,), name="mlp_input")
-    gate = keras.layers.Dense(dims.intermediate, name="gate_proj", kernel_initializer=init)(inputs)
+    # Qwen MLP projections are bias-free; keeping them so here also lets the custom
+    # HLS kernel (which has no bias term) match this golden during cosim.
+    gate = keras.layers.Dense(dims.intermediate, name="gate_proj", use_bias=False, kernel_initializer=init)(inputs)
     gate_act = keras.layers.Activation("swish", name="silu")(gate)  # keras 'swish' == SiLU
-    up = keras.layers.Dense(dims.intermediate, name="up_proj", kernel_initializer=init)(inputs)
+    up = keras.layers.Dense(dims.intermediate, name="up_proj", use_bias=False, kernel_initializer=init)(inputs)
     gated = keras.layers.Multiply(name="gate_mul")([gate_act, up])
-    out = keras.layers.Dense(dims.hidden, name="down_proj", kernel_initializer=init)(gated)
+    out = keras.layers.Dense(dims.hidden, name="down_proj", use_bias=False, kernel_initializer=init)(gated)
     model = keras.Model(inputs=inputs, outputs=out, name=f"QwenMLPTile_d{tile_div}")
     return model, dims
 

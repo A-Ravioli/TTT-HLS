@@ -9,9 +9,11 @@ Two modes:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,31 @@ from compiler.hls_build import HLSBuildResult, run_cosim as _vitis_cosim, vitis_
 from paths import get_logger
 
 logger = get_logger("burnttt.compiler.cosim")
+
+
+@lru_cache(maxsize=1)
+def ap_types_include_dirs() -> tuple[str, ...]:
+    """Locate Xilinx ``ap_*`` headers so software cosim can compile ``ap_fixed.h``.
+
+    The kernels ``#include <ap_fixed.h>``; without these on the include path g++
+    fails before any numeric check runs. Sources, in order: ``BURN_AP_TYPES_INCLUDE``
+    (colon-separated), then hls4ml's bundled ``ap_types`` directory if installed.
+    """
+    dirs: list[str] = []
+    env = os.environ.get("BURN_AP_TYPES_INCLUDE", "").strip()
+    if env:
+        dirs.extend(p for p in env.split(os.pathsep) if p)
+    try:
+        import hls4ml  # noqa: F401
+
+        cand = Path(hls4ml.__file__).parent / "templates" / "vivado" / "ap_types"
+        if cand.is_dir():
+            dirs.append(str(cand))
+    except Exception:  # noqa: BLE001 - hls4ml is optional
+        pass
+    # De-dup while preserving order.
+    seen: set[str] = set()
+    return tuple(d for d in dirs if not (d in seen or seen.add(d)))
 
 
 @dataclass
@@ -109,10 +136,14 @@ def _software_cosim(
         )
 
     exe_path = project_dir / "sw_cosim"
+    ap_includes: list[str] = []
+    for d in ap_types_include_dirs():
+        ap_includes += ["-I", d]
     compile_cmd = [
-        "g++", "-O2", "-std=c++17",
+        "g++", "-O2", "-std=c++14",
         "-I", str(src_dir),
         "-I", str(project_dir),
+        *ap_includes,
         str(tb_path),
         *[str(f) for f in src_files],
         "-o", str(exe_path),

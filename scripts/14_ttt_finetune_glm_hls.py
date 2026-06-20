@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from glm.finetune.dataset_hls import to_hls_preference_pairs, to_hls_sft_examples
 from glm.tasks import FpgaTask, make_task
 from infra.trace_store import HLSTraceStore
+from models.qwen.blocks import tile_dims
 from models.qwen.decompose import mlp_block_spec
 from models.qwen.load_qwen import get_default_arch
 from paths import ensure_dirs, get_logger
@@ -32,12 +33,19 @@ def main():
     parser.add_argument("--run-name", default="glm_hls_ttt", help="Trace store run name")
     parser.add_argument("--steps", type=int, default=8, help="LoRA gradient steps")
     parser.add_argument("--part", default="xcu250-figd2104-2l-e", help="Target part")
-    parser.add_argument("--hidden-dim", type=int, default=24, help="Hidden dim (tiled)")
-    parser.add_argument("--intermediate-dim", type=int, default=64, help="Intermediate dim (tiled)")
+    parser.add_argument("--tile-div", type=int, default=64, help="Tile divisor for Qwen dims")
+    parser.add_argument("--hidden-dim", type=int, default=None, help="Override tiled hidden dim")
+    parser.add_argument("--intermediate-dim", type=int, default=None, help="Override tiled intermediate dim")
     args = parser.parse_args()
 
     ensure_dirs()
     arch = get_default_arch()
+
+    # Derive the tiled dims from the architecture so they match the golden the
+    # kernels in script 11 were authored against (defaults of 24/64 did not).
+    dims = tile_dims(arch, args.tile_div)
+    hidden_dim = args.hidden_dim if args.hidden_dim is not None else dims.hidden
+    intermediate_dim = args.intermediate_dim if args.intermediate_dim is not None else dims.intermediate
 
     # Build task
     block_spec = mlp_block_spec(arch)
@@ -52,23 +60,26 @@ def main():
         print(f"No traces found for '{args.run_name}'. Run script 11 first.")
         return
 
-    # Convert to training-compatible format
+    # Convert to training-compatible format. Carry sources + method/round_idx so
+    # the dataset builders (incl. repair-pair mining) have everything they need.
     rows = []
     for t in traces:
         row = dict(t.result)
         row["sources"] = t.sources
+        row["method"] = t.method
+        row["round_idx"] = t.round_idx
         rows.append(row)
 
     # Generate training examples
     sft_examples = to_hls_sft_examples(
         task, rows,
-        hidden_dim=args.hidden_dim,
-        intermediate_dim=args.intermediate_dim,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
     )
     dpo_pairs = to_hls_preference_pairs(
         task, rows,
-        hidden_dim=args.hidden_dim,
-        intermediate_dim=args.intermediate_dim,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
     )
 
     print(f"\n=== HLS TTT Finetune Report ===")
@@ -98,8 +109,8 @@ def main():
         agent = GLMCompilerAgent()
         trainer = HLSTestTimeTrainer(
             agent, task,
-            hidden_dim=args.hidden_dim,
-            intermediate_dim=args.intermediate_dim,
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
             steps_per_round=args.steps,
         )
         if trainer.is_real:

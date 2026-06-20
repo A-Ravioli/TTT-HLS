@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from glm.agent_hls import result_to_hls_history_row
 from glm.finetune.dataset import (
     to_preference_pairs,
     to_repair_preference_pairs,
@@ -42,6 +43,36 @@ def test_sft_excludes_high_max_error():
     rows = [_cfg_row(100, 0.01), _cfg_row(90, 0.5)]
     examples = to_sft_examples(task, rows)
     assert len(examples) == 1
+
+
+def test_sft_top_frac_selects_fewer_with_smaller_fraction():
+    task = _task(0.25)
+    rows = [_cfg_row(r, 0.01) for r in (100, 80, 60, 40, 20)]
+    all_kept = to_sft_examples(task, rows, top_frac=1.0)
+    half = to_sft_examples(task, rows, top_frac=0.5)
+    tight = to_sft_examples(task, rows, top_frac=0.2)
+    assert len(all_kept) == 5            # top_frac was previously ignored (always all)
+    assert len(tight) <= len(half) <= len(all_kept)
+    assert len(tight) >= 1               # always keep at least the best
+
+
+def test_hls_history_row_without_sources_yields_no_training_data():
+    # Regression for the HLS-TTT no-op: the metric-only history row (what the
+    # trainer used to receive) carries no `sources`, so the corpus was empty.
+    task = _task(0.01)
+    result = {
+        "hls_compile_success": True,
+        "cosim_pass": True,
+        "reward": 100.0,
+        "max_error": 0.005,
+    }
+    metric_only = result_to_hls_history_row(result)
+    assert "sources" not in metric_only or metric_only.get("sources") is None
+    assert to_hls_sft_examples(task, [metric_only]) == []
+
+    # ...but once sources travel with the row (as script 11 now does), it works.
+    train_row = {**metric_only, "sources": {"kernel_top.cpp": "// ok"}}
+    assert len(to_hls_sft_examples(task, [train_row])) == 1
 
 
 def test_preference_pairs_require_chosen_accuracy():

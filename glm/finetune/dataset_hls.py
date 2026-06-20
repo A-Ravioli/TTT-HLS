@@ -30,10 +30,17 @@ class HLSPreferencePair:
     rejected: str
 
 
+# Files supplied to the kernel rather than authored by the model -- excluded from
+# the training completion (we don't want the LLM learning to emit baked weights).
+_PROVIDED_FILES = {"weights.h"}
+
+
 def _sources_to_completion(sources: dict[str, str]) -> str:
     """Format kernel sources as the completion the LLM should have produced."""
     parts = []
     for filename in sorted(sources.keys()):
+        if filename in _PROVIDED_FILES:
+            continue
         parts.append(f"```cpp\n// file: {filename}\n{sources[filename]}\n```")
     return "\n\n".join(parts)
 

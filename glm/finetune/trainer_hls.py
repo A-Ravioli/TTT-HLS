@@ -187,7 +187,11 @@ class HLSTestTimeTrainer:
         prompt_ids = tok(prompt_text, return_tensors="pt").input_ids[0]
         labels = full_ids.clone()
         labels[:, : min(len(prompt_ids), labels.shape[1])] = -100
-        return model(input_ids=full_ids, labels=labels).loss
+        # Summed NLL over completion tokens (see config-mode trainer): DPO needs
+        # sequence log-probs, not HF's length-normalized mean.
+        out = model(input_ids=full_ids, labels=labels)
+        n_tok = (labels != -100).sum().clamp(min=1)
+        return out.loss * n_tok
 
     def _encode(self, tok, ex, device):
         prompt_text = tok.apply_chat_template(

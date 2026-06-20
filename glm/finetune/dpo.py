@@ -38,7 +38,11 @@ def _completion_nll(
     prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0]
     labels = full_ids.clone()
     labels[:, : min(len(prompt_ids), labels.shape[1])] = -100
-    return model(input_ids=full_ids, labels=labels).loss
+    # Summed (not length-normalized) NLL over completion tokens: DPO compares
+    # sequence log-probs, so a per-token mean would bias toward shorter sequences.
+    out = model(input_ids=full_ids, labels=labels)
+    n_tok = (labels != -100).sum().clamp(min=1)
+    return out.loss * n_tok
 
 
 def train_dpo_step(

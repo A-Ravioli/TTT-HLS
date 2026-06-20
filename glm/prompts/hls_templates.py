@@ -10,6 +10,16 @@ from __future__ import annotations
 import json
 from typing import Any
 
+_WEIGHTS_NOTE = (
+    "\n### Weights are provided:\n"
+    "The projection matrices are supplied in `weights.h` as\n"
+    "`static const weight_t gate_w[HIDDEN_DIM][INTER_DIM]`, `up_w[HIDDEN_DIM][INTER_DIM]`,\n"
+    "and `down_w[INTER_DIM][HIDDEN_DIM]`. `#include \"weights.h\"` and use these arrays\n"
+    "directly -- do NOT declare your own gate_w/up_w/down_w (that is a redefinition\n"
+    "error) and do NOT zero-initialize weights. Each projection computes `y = x @ W`.\n"
+)
+
+
 HLS_SYSTEM_PROMPT = (
     "You are GLM, a test-time-adaptive FPGA compiler. You author and iteratively "
     "edit Vitis HLS C++ source code to implement neural-network sub-blocks on FPGA "
@@ -30,9 +40,11 @@ def build_hls_propose_prompt(
     intermediate_dim: int,
     seed_template: str | None = None,
     history: list[dict[str, Any]] | None = None,
+    weights_provided: bool = False,
 ) -> str:
     """Prompt asking GLM to author a new HLS kernel (or improve from seed)."""
     history_text = _format_hls_history(history) if history else "No prior attempts."
+    weights_note = _WEIGHTS_NOTE if weights_provided else ""
 
     seed_section = ""
     if seed_template:
@@ -68,7 +80,7 @@ def build_hls_propose_prompt(
 - `#pragma HLS UNROLL factor=N` — unroll inner dot products
 - `#pragma HLS INTERFACE m_axi port=X` — AXI memory-mapped
 - `#pragma HLS DATAFLOW` — enable task-level pipelining between stages
-{seed_section}
+{weights_note}{seed_section}
 ### Prior attempts on this task:
 {history_text}
 
@@ -87,11 +99,13 @@ def build_hls_repair_prompt(
     current_source: str,
     error_msg: str,
     error_type: str = "compile",
+    weights_provided: bool = False,
 ) -> str:
     """Prompt asking GLM to fix an HLS kernel that failed.
 
     error_type: "compile" | "cosim" | "timing"
     """
+    weights_note = _WEIGHTS_NOTE if weights_provided else ""
     repair_guidance = {
         "compile": (
             "The kernel FAILED C-synthesis. Common causes:\n"
@@ -140,7 +154,7 @@ def build_hls_repair_prompt(
 
 ### Diagnosis guidance:
 {guidance}
-
+{weights_note}
 ### Instructions:
 Fix the issue and emit the corrected complete source files (kernel_top.h and kernel_top.cpp).
 Do NOT change the function signature or remove existing optimizations unless they cause the error.
