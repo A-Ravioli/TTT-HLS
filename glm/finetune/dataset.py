@@ -35,9 +35,54 @@ class PreferencePair:
     rejected: str
 
 
-def _completion(config: dict[str, Any]) -> str:
+def serialize_config_completion(config: dict[str, Any]) -> str:
+    """Serialize a config dict to the JSON the GLM should have produced.
+
+    Handles all three artifact schemas so SFT/DPO/GRPO targets are never
+    degenerate-null:
+
+    * ``BurnConfig``   -> the 6 flat precision/reuse fields,
+    * ``BlockConfig``  -> per-layer ``layers`` + ``strategy``/``io_type``,
+    * ``KernelBundle`` -> tiling/precision metadata (sources excluded; too long).
+    """
+    if "layers" in config:  # BlockConfig
+        layers = {}
+        for name, k in (config.get("layers") or {}).items():
+            if isinstance(k, dict):
+                layers[name] = {
+                    "weight_bits": k.get("weight_bits"),
+                    "activation_bits": k.get("activation_bits"),
+                    "int_bits": k.get("int_bits"),
+                    "reuse": k.get("reuse"),
+                }
+        return json.dumps(
+            {
+                "layers": layers,
+                "strategy": config.get("strategy"),
+                "io_type": config.get("io_type"),
+            }
+        )
+    if "tile_hidden" in config or "top_function" in config:  # KernelBundle metadata
+        keep = (
+            "top_function",
+            "hidden_dim",
+            "intermediate_dim",
+            "weight_bits",
+            "weight_int_bits",
+            "act_bits",
+            "act_int_bits",
+            "tile_hidden",
+            "tile_inter",
+            "axi_width_bits",
+            "double_buffer",
+        )
+        return json.dumps({k: config.get(k) for k in keep if k in config})
     keep = ("weight_bits", "activation_bits", "int_bits", "reuse_dense_1", "reuse_dense_2", "strategy")
     return json.dumps({k: config.get(k) for k in keep})
+
+
+def _completion(config: dict[str, Any]) -> str:
+    return serialize_config_completion(config)
 
 
 def _passes_accuracy(row: dict[str, Any], max_error_threshold: float) -> bool:

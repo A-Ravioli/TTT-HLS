@@ -20,10 +20,9 @@ class GRPOExample:
 
 
 def _completion(config: dict[str, Any]) -> str:
-    import json
+    from glm.finetune.dataset import serialize_config_completion
 
-    keep = ("weight_bits", "activation_bits", "int_bits", "reuse_dense_1", "reuse_dense_2", "strategy")
-    return json.dumps({k: config.get(k) for k in keep})
+    return serialize_config_completion(config)
 
 
 def group_advantages(rewards: list[float], eps: float = 1e-6) -> list[float]:
@@ -75,15 +74,27 @@ def grpo_policy_loss(
     device,
     max_len: int,
     apply_chat_template=None,
+    kl_coef: float = 0.0,
 ) -> tuple[Any, dict[str, float]]:
-    """Policy-gradient loss: -E[ advantage * log pi(completion|prompt) ]."""
+    """GRPO loss: ``-E[ advantage * log pi ] + kl_coef * KL(pi || ref)``.
+
+    The KL term anchors the test-time-adapted policy to the frozen base model
+    (the LoRA adapter disabled), which prevents collapse/drift when only a handful
+    of trajectories are available per round. KL is the standard low-variance
+    estimator ``exp(d) - d - 1`` with ``d = logp_ref - logp`` and is skipped when
+    ``kl_coef <= 0`` or the model has no ``disable_adapter`` context.
+    """
     import torch
+    from contextlib import nullcontext
 
     if not examples:
         zero = torch.tensor(0.0, device=device, requires_grad=True)
         return zero, {"grpo_loss": 0.0, "grpo_n": 0}
 
+    can_kl = kl_coef > 0.0 and hasattr(model, "disable_adapter")
+
     total = torch.tensor(0.0, device=device)
+    kl_total = torch.tensor(0.0, device=device)
     n = 0
     for ex in examples:
         if apply_chat_template is not None:
@@ -109,9 +120,20 @@ def grpo_policy_loss(
         nll = model(input_ids=full_ids, labels=labels).loss
         logp = -nll
         total = total + (-ex.advantage * logp)
+
+        if can_kl:
+            with model.disable_adapter():
+                with torch.no_grad():
+                    ref_logp = -model(input_ids=full_ids, labels=labels).loss
+            d = ref_logp - logp
+            kl_total = kl_total + (torch.exp(d) - d - 1.0)
         n += 1
 
     loss = total / max(1, n)
+    if can_kl:
+        kl = kl_total / max(1, n)
+        loss = loss + kl_coef * kl
+
     stats = {
         "grpo_loss": float(loss.detach()),
         "grpo_n": n,
@@ -120,4 +142,6 @@ def grpo_policy_loss(
         "grpo_reward_max": max(ex.reward for ex in examples),
         "grpo_reward_min": min(ex.reward for ex in examples),
     }
+    if can_kl:
+        stats["grpo_kl"] = float(kl.detach())
     return loss, stats

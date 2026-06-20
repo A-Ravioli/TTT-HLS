@@ -48,6 +48,7 @@ class TestTimeTrainer:
         dpo_weight: float = 0.5,
         dpo_beta: float = 0.1,
         grpo_min_group: int = 2,
+        grpo_kl_coef: float | None = None,
         anchor_regression_threshold: float = -50.0,
         run_name: str = "glm_ttt",
         evaluate_fn: Callable[[Any], dict[str, Any]] | None = None,
@@ -73,6 +74,9 @@ class TestTimeTrainer:
         self.use_sft = use_sft
         self.use_dpo = use_dpo
         self.grpo_min_group = grpo_min_group
+        if grpo_kl_coef is None:
+            grpo_kl_coef = float(os.environ.get("BURN_TTT_GRPO_KL", "0.02").strip() or 0.02)
+        self.grpo_kl_coef = grpo_kl_coef
         env_steps = os.environ.get("BURN_TTT_STEPS_PER_ROUND", "").strip()
         if env_steps:
             self.steps_per_round = int(env_steps)
@@ -265,6 +269,7 @@ class TestTimeTrainer:
                 device,
                 self.max_seq_len,
                 apply_chat_template=apply_tpl,
+                kl_coef=self.grpo_kl_coef,
             )
             loss.backward()
             self._optimizer.step()

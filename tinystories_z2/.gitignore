@@ -1,0 +1,6 @@
+# Large generated artifacts -- regenerate with export_tinystories.py
+weights/
+build/
+*.so
+*.dylib
+*.o

@@ -35,10 +35,24 @@ nvidia-smi -L || true
 echo "=== Training toy model ==="
 python scripts/00_train_model.py
 
-echo "=== TTT finetune GLM (config mode) ==="
-python scripts/07_ttt_finetune_glm.py --rounds "${ROUNDS:-8}" --candidates-per-round "${CANDIDATES:-3}"
+if [[ "${REWARD_SWEEP:-1}" == "1" ]]; then
+  echo "=== Reward-variant TTT sweep (different rewards, iterating) ==="
+  SWEEP_ARGS=(--rounds "${ROUNDS:-8}" --candidates-per-round "${CANDIDATES:-3}"
+              --loop "${SWEEP_LOOP:-1}" --top-k "${SWEEP_TOP_K:-2}"
+              --escalate-rounds "${SWEEP_ESCALATE:-2}")
+  if [[ -n "${REWARD_VARIANTS:-}" ]]; then
+    SWEEP_ARGS+=(--variants "${REWARD_VARIANTS}")
+  fi
+  if [[ "${REWARD_INCLUDE_LEGACY:-0}" == "1" ]]; then
+    SWEEP_ARGS+=(--include-legacy)
+  fi
+  python scripts/19_reward_sweep.py "${SWEEP_ARGS[@]}"
+else
+  echo "=== TTT finetune GLM (single reward=${BURN_REWARD_VARIANT:-v2_balanced}) ==="
+  python scripts/07_ttt_finetune_glm.py --rounds "${ROUNDS:-8}" --candidates-per-round "${CANDIDATES:-3}"
+fi
 
-echo "=== Dataset gating tests ==="
-python -m pytest tests/test_ttt_dataset.py -q
+echo "=== Reward + dataset gating tests ==="
+python -m pytest tests/test_reward.py tests/test_reward_hls.py tests/test_reward_sweep.py tests/test_ttt_dataset.py -q
 
 echo "=== Done ==="

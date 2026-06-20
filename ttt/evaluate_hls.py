@@ -188,6 +188,17 @@ def evaluate_hls(
             result["tokens_per_sec"] = estimate_tokens_per_sec(cycles_est, assumed_clock_mhz)
             result["timing_met"] = True  # Estimated
 
+        # Populate analytical resource estimates whenever real synthesis did not.
+        # This is what makes "bigger tiles" cost DSP/LUT/BRAM so the reward cannot
+        # be hacked by inflating tile sizes for free throughput in the no-toolchain
+        # path (the over-budget tier then penalizes infeasible designs).
+        if result.get("dsp") is None:
+            est = _estimate_hls_resources(bundle)
+            for k, v in est.items():
+                if result.get(k) is None:
+                    result[k] = v
+            result["estimated_hw"] = True
+
     # --- Stage 6: Reward ----------------------------------------------------
     result["reward"] = reward_hls(result)
     result["eval_seconds"] = round(time.time() - t0, 2)
@@ -205,6 +216,33 @@ def evaluate_hls(
         result["eval_seconds"],
     )
     return result
+
+
+def _estimate_hls_resources(bundle: KernelBundle) -> dict[str, Any]:
+    """Rough, monotonic resource estimate for a SwiGLU-MLP-style KernelBundle.
+
+    The spatial parallelism of the kernel is ~``tile_hidden * tile_inter`` MAC
+    lanes (shared across the 3 matmuls of a SwiGLU MLP). Each lane costs roughly
+    one DSP (two for wide words) plus some LUT/FF; weights are stored in BRAM.
+    These are deliberately simple but *monotonic in the tile sizes* so that the
+    over-budget tier can react to oversized designs without a real toolchain.
+    """
+    import math
+
+    lanes = max(1, int(bundle.tile_hidden) * int(bundle.tile_inter))
+    bits = max(int(bundle.weight_bits), int(bundle.act_bits))
+    dsp_per_lane = 1 if bits <= 18 else 2
+
+    dsp = lanes * dsp_per_lane
+    lut = int(round(lanes * (55.0 * (bits / 16.0) + 30.0)))
+    ff = int(round(lanes * (80.0 * (bits / 16.0) + 40.0)))
+
+    # Weight storage across the 3 projections (gate/up: hidden->inter, down: inter->hidden).
+    total_weights = 3 * int(bundle.hidden_dim) * int(bundle.intermediate_dim)
+    weight_bits = total_weights * int(bundle.weight_bits)
+    bram = math.ceil(weight_bits / (18 * 1024))
+
+    return {"dsp": int(dsp), "lut": int(lut), "ff": int(ff), "bram": int(bram)}
 
 
 def _default_testbench() -> str:

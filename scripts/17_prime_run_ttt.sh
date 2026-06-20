@@ -102,7 +102,15 @@ ssh_cmd "cd ${REMOTE_DIR} && \
   export BURN_TTT_USE_DPO='${BURN_TTT_USE_DPO:-0}' && \
   export BURN_TTT_STEPS_PER_ROUND='${BURN_TTT_STEPS_PER_ROUND:-4}' && \
   export BURN_TTT_LR='${BURN_TTT_LR:-1e-4}' && \
+  export BURN_TTT_GRPO_KL='${BURN_TTT_GRPO_KL:-0.02}' && \
   export BURN_TTT_RUN_NAME='${BURN_TTT_RUN_NAME:-glm_ttt}' && \
+  export BURN_REWARD_VARIANT='${BURN_REWARD_VARIANT:-v2_balanced}' && \
+  export REWARD_SWEEP='${REWARD_SWEEP:-1}' && \
+  export REWARD_VARIANTS='${REWARD_VARIANTS:-}' && \
+  export REWARD_INCLUDE_LEGACY='${REWARD_INCLUDE_LEGACY:-0}' && \
+  export SWEEP_LOOP='${SWEEP_LOOP:-1}' && \
+  export SWEEP_TOP_K='${SWEEP_TOP_K:-2}' && \
+  export SWEEP_ESCALATE='${SWEEP_ESCALATE:-2}' && \
   export UNSLOTH_MOE_BACKEND='grouped_mm' && \
   export ROUNDS='${ROUNDS}' && \
   export CANDIDATES='${CANDIDATES}' && \
