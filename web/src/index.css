@@ -1,0 +1,237 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ============================================================
+   Kabisat Demo — display serif for the hero wordmark
+   (free demo variant: Italic Tall, by Mofr24 — personal use)
+   ============================================================ */
+@font-face {
+  font-family: "Kabisat Demo";
+  src: url("/fonts/KabisatDemo-ItalicTall.ttf") format("truetype");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ============================================================
+   Theme — "Mercury Light": white surfaces, hibiscus-purple accent
+   Adapted from the GIODESDR Mercury palette, inverted to light.
+   ============================================================ */
+:root {
+  /* Hibiscus purple brand ramp */
+  --hibiscus: #b43757;
+  --hibiscus-bright: #d24470;
+  --hibiscus-deep: #8e2c50;
+  --hibiscus-purple: #7c2e63;
+  --hibiscus-violet: #5e2a6e;
+  --hibiscus-soft: rgba(180, 55, 87, 0.1);
+  --hibiscus-line: rgba(180, 55, 87, 0.22);
+  --wordmark-extrude: #2a0f1e; /* dark plum 3D extrusion behind the hero title */
+
+  /* Neutrals */
+  --paper: #ffffff;
+  --paper-2: #faf7f8;
+  --ink: #1a1417;
+  --ink-2: #564f56;
+  --ink-3: #6e6870;
+  --hairline: rgba(26, 20, 23, 0.1);
+
+  /* shadcn tokens — light */
+  --background: #ffffff;
+  --foreground: #1a1417;
+  --card: rgba(255, 255, 255, 0.72);
+  --card-foreground: #1a1417;
+  --popover: #ffffff;
+  --popover-foreground: #1a1417;
+  --primary: #b43757;
+  --primary-foreground: #ffffff;
+  --secondary: #f4eef0;
+  --secondary-foreground: #1a1417;
+  --muted: #f4f1f3;
+  --muted-foreground: #8d858d;
+  --accent: rgba(180, 55, 87, 0.1);
+  --accent-foreground: #8e2c50;
+  --destructive: #c0392b;
+  --destructive-foreground: #ffffff;
+  --border: rgba(26, 20, 23, 0.1);
+  --input: rgba(26, 20, 23, 0.12);
+  --ring: rgba(180, 55, 87, 0.45);
+  --radius: 0rem;
+
+  --sidebar: rgba(255, 255, 255, 0.66);
+  --sidebar-foreground: #1a1417;
+  --sidebar-border: rgba(26, 20, 23, 0.08);
+}
+
+.dark {
+  --paper: #140f12;
+  --paper-2: #1b1418;
+  --ink: #f6eef1;
+  --ink-2: #c9bdc3;
+  --ink-3: #9a8d94;
+  --hairline: rgba(255, 255, 255, 0.1);
+
+  --background: #140f12;
+  --foreground: #f6eef1;
+  --card: rgba(33, 24, 29, 0.72);
+  --card-foreground: #f6eef1;
+  --popover: #1b1418;
+  --popover-foreground: #f6eef1;
+  --primary: #e0588a;
+  --primary-foreground: #140f12;
+  --secondary: #2a1e24;
+  --secondary-foreground: #f6eef1;
+  --muted: #241a1f;
+  --muted-foreground: #9a8d94;
+  --accent: rgba(210, 68, 112, 0.16);
+  --accent-foreground: #f0b8cb;
+  --border: rgba(255, 255, 255, 0.1);
+  --input: rgba(255, 255, 255, 0.14);
+  --ring: rgba(210, 68, 112, 0.5);
+
+  --sidebar: rgba(27, 19, 24, 0.6);
+  --sidebar-foreground: #f6eef1;
+  --sidebar-border: rgba(255, 255, 255, 0.08);
+}
+
+@theme inline {
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --font-serif: "Kabisat Demo", "Times New Roman", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-hibiscus: var(--hibiscus);
+  --color-hibiscus-bright: var(--hibiscus-bright);
+  --color-hibiscus-deep: var(--hibiscus-deep);
+  --color-hibiscus-purple: var(--hibiscus-purple);
+
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+
+  /* No rounded corners anywhere — Hermes rectangular style */
+  --radius-sm: 0px;
+  --radius-md: 0px;
+  --radius-lg: 0px;
+  --radius-xl: 0px;
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+    box-sizing: border-box;
+  }
+
+  /* Hard rule: every element is rectangular. */
+  *,
+  *::before,
+  *::after {
+    border-radius: 0 !important;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    letter-spacing: -0.01em;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    overflow: hidden;
+  }
+
+  ::selection {
+    background: rgba(180, 55, 87, 0.18);
+    color: var(--ink);
+  }
+
+  /* Thin hibiscus scrollbars */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(180, 55, 87, 0.28);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(180, 55, 87, 0.45);
+  }
+}
+
+@layer components {
+  /* Big serif hero wordmark, like the Hermes Agent title */
+  .hero-wordmark {
+    font-family: var(--font-serif);
+    font-weight: 400;
+    letter-spacing: 0.08em;
+    line-height: 1.15;
+    /* solid fill + overflow room for the italic slant and the 3D extrusion */
+    padding: 0.12em 0.5em 0.28em 0.12em;
+    overflow: visible;
+    /* Native Kabisat look — keep the font's built-in -20deg italic slant.
+       Solid lighter-hibiscus fill with a hard 3D extruded drop shadow. */
+    color: var(--hibiscus-bright);
+    text-shadow:
+      1px 1px 0 var(--wordmark-extrude),
+      2px 2px 0 var(--wordmark-extrude),
+      3px 3px 0 var(--wordmark-extrude),
+      4px 4px 0 var(--wordmark-extrude),
+      5px 5px 0 var(--wordmark-extrude),
+      6px 6px 0 var(--wordmark-extrude),
+      7px 7px 0 var(--wordmark-extrude),
+      11px 13px 16px rgba(40, 10, 25, 0.3);
+  }
+
+  /* Frosted white panel over the galaxy */
+  .surface {
+    background: var(--sidebar);
+    backdrop-filter: blur(14px) saturate(120%);
+    -webkit-backdrop-filter: blur(14px) saturate(120%);
+  }
+
+  .surface-strong {
+    background: var(--card);
+    backdrop-filter: blur(18px) saturate(125%);
+    -webkit-backdrop-filter: blur(18px) saturate(125%);
+  }
+
+  /* Hibiscus focus glow used on the composer */
+  .focus-hibiscus:focus-within {
+    border-color: var(--hibiscus) !important;
+    box-shadow: 0 0 0 1px var(--hibiscus), 0 0 26px rgba(180, 55, 87, 0.16);
+  }
+}
