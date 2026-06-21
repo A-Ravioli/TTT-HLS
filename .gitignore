@@ -50,3 +50,4 @@ vitis*.log
 .env.pod
 etched-hack.pem
 *.pem
+/tinystories_z2/golden

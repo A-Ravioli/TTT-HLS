@@ -20,23 +20,19 @@ from tinystories_z2.model import NeoArch, NeoRunner, QuantWeights
 
 
 def make_backend(name: str):
-    """Select the GEMV backend. ``numpy`` is always available (FPGA-equivalent).
+    """Select the GEMV backend (``numpy`` | ``cpp`` | ``pynq``).
 
-    ``pynq`` (Stage 3) drives the real Zynq-7020 overlay; importing it off-board
-    fails, so we fall back to the numpy reference with a clear note.
+    ``numpy`` and ``cpp`` are FPGA-equivalent integer math; ``pynq`` (Stage 3)
+    drives the real Zynq-7020 overlay. Anything unavailable off-board falls back
+    to the numpy reference with a clear note.
     """
-    name = name.lower()
-    if name == "numpy":
-        return None  # NeoRunner uses gemv_int8_quantized directly
-    if name in ("pynq", "fpga"):
-        try:
-            from tinystories_z2.host.pynq_gemv import PynqGemv  # noqa: F401
+    from tinystories_z2.host.gemv_backends import make_gemv_backend
 
-            return PynqGemv()
-        except Exception as exc:  # noqa: BLE001
-            print(f"[generate] pynq backend unavailable ({exc}); using numpy reference")
-            return None
-    raise ValueError(f"unknown backend {name!r}")
+    try:
+        return make_gemv_backend(name)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[generate] backend {name!r} unavailable ({exc}); using numpy reference")
+        return None
 
 
 def main() -> None:
@@ -47,7 +43,7 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top-k", type=int, default=40)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--backend", default="numpy", choices=["numpy", "pynq", "fpga"])
+    ap.add_argument("--backend", default="numpy", choices=["numpy", "cpp", "pynq", "fpga"])
     args = ap.parse_args()
 
     manifest = json.loads(Path(args.manifest).read_text())

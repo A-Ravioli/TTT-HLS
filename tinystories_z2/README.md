@@ -52,34 +52,55 @@ The numpy backend is **bit-exact to the integer arithmetic the FPGA will run**, 
 "coherent text here" means the hardware has a correct, matching target — exactly
 the de-risking the `qwen_fpga` C++ datapath provides for F2.
 
-## Stage 2 — the Z2 GEMV kernel + bitstream (needs Linux + Vivado)
+## Stage 2 — the Z2 GEMV kernel + bitstream (built; verified in software)
 
-A small Vitis-HLS W8A8 GEMV mirroring `quant.gemv_int8_quantized`:
+A small Vitis-HLS W8A8 GEMV mirroring `quant.gemv_int8_quantized`
+(`kernel/gemv_int8_hls.cpp`):
 
 ```c
 // y[m] = x_scale * w_scale[m] * sum_n ( wq[m,n] * xq[n] )
-//   m_axi gmem_w  : INT8 weights  [M*N]   -> S_AXI_HP0 (PS DDR)
-//   m_axi gmem_s  : fp16 scales   [M]     -> S_AXI_HP0
-//   m_axi gmem_x  : INT8 acts     [N]     -> S_AXI_HP1
-//   m_axi gmem_y  : fp32 out      [M]     -> S_AXI_HP1
-//   s_axilite     : x_scale, M, N, ap_ctrl  -> M_AXI_GP0
+//   m_axi gmem_w     : INT8 weights  [M*N]   -> S_AXI_HP0 (PS DDR)
+//   m_axi gmem_scale : fp16 scales   [M]     -> S_AXI_HP0
+//   m_axi gmem_x     : INT8 acts     [N]     -> S_AXI_HP1
+//   m_axi gmem_y     : fp32 out      [M]     -> S_AXI_HP1
+//   s_axilite        : x_scale, M, N, ap_ctrl  -> M_AXI_GP0
 ```
 
-It is a *simplification* of `qwen_fpga/kernel/gemv_int4_hls.cpp`: no nibble
-unpacking, no group loop, and the activation cache binds to **BRAM** (the Z7020
-has no URAM). DSP unroll ~32–64 wide fits the 220-DSP budget; decode stays
-memory-bound on DDR bandwidth.
+A *simplification* of `qwen_fpga/kernel/gemv_int4_hls.cpp`: no nibble unpacking,
+no group loop, activation cache binds to **BRAM** (Z7020 has no URAM), inner MAC
+unrolled 16-wide (fits the 220-DSP budget; decode stays memory-bound on DDR).
 
-Build (on Linux x86 — **Vivado does not run on macOS**; free Vivado ML Standard
-covers XC7Z020):
+**The datapath is already proven in software** — the HLS C++ is plain-compilable,
+and `make check` runs the exact arithmetic against numpy golden vectors:
+
+```bash
+python -m tinystories_z2.reference.make_golden \
+    --manifest tinystories_z2/weights/TinyStories-1M/manifest.json
+make -C tinystories_z2 check     # -> 49/49 cases, worst rel 1.1e-7
+python -m tinystories_z2.generate --backend cpp --manifest .../manifest.json   # coherent
+```
+
+So the FPGA build only has to reproduce bits the C++ kernel already matches.
+
+**Bitstream build** (Linux x86 — **Vivado does not run on macOS**; free Vivado ML
+Standard covers XC7Z020). Match Vivado to the board image: PYNQ-Z2 v2.7 → **2020.2**;
+PYNQ 3.0 → **2022.1**; drop the TUL pynq-z2 board files into `<Vivado>/data/boards/`.
 
 ```
-vitis_hls -f hdk/run_hls.tcl          # HLS C++ -> RTL IP
-vivado    -source hdk/build_bd.tcl     # Zynq7 PS + gemv IP -> .bit + .hwh
+vitis_hls -f hdk/run_hls.tcl           # HLS C++ -> RTL IP
+vivado -mode batch -source hdk/build_bd.tcl   # Zynq7 PS + gemv IP -> build/gemv_int8.{bit,hwh}
 ```
 
-Match Vivado to the board image: PYNQ-Z2 v2.7 → Vivado **2020.2**; PYNQ 3.0 →
-**2022.1**. Drop the TUL pynq-z2 board files into `<Vivado>/data/boards/`.
+**On a Prime Intellect node** (reuses `infra/prime_pod.py` + `.env.pod`):
+
+```bash
+python scripts/20_prime_fpga_build.py --probe   # check Vivado on the node
+python scripts/20_prime_fpga_build.py           # rsync -> HLS -> Vivado -> rsync .bit/.hwh back
+```
+
+Vivado is account/license-gated and **not** on stock Prime images; the bootstrap
+(`hdk/prime_fpga_bootstrap.sh`) prints exact install steps if it's missing rather
+than faking a build.
 
 ## Stage 3 — on-board bring-up
 

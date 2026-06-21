@@ -1,6 +1,9 @@
-# Large generated artifacts -- regenerate with export_tinystories.py
+# Large generated artifacts -- regenerate with export_tinystories.py / make_golden.py
 weights/
+golden/
 build/
+vivado_prj/
+gemv_int8_prj/
 *.so
 *.dylib
 *.o
