@@ -1,4 +1,14 @@
-# 🔥 BurnTTT — a GLM that compiles models onto FPGAs, finetuned at test time
+<div align="center">
+
+<img src="assets/burntttlogo.png" alt="BurnTTT logo" width="380">
+
+# 🔥 BurnTTT
+
+### a GLM that compiles models onto FPGAs, finetuned at test time
+
+_Etched x Mercor x Cognition x Anthropic Hackathon 2026_
+
+</div>
 
 BurnTTT is a **test-time-trained LLM compiler**. An LLM (**GLM**) *authors* the
 hardware-generation config that maps a neural-network block onto FPGA fabric via
@@ -243,16 +253,3 @@ python -m pytest tests -q
 - **Heuristic stand-in off-GPU.** Without GLM weights the heuristic backend
   demonstrates the same loop; the real contribution is the LoRA test-time loop
   when a GLM is present.
-
-## 13. What to say in a demo
-
-1. "We treat each `(model block, FPGA part)` as a fresh task."
-2. "**GLM authors** the hardware config; failed compiles are **repaired** by
-   feeding the error back to the model."
-3. "We **finetune GLM's own weights (LoRA) at test time** on this task's
-   synthesis/simulation feedback — watch the reward-vs-step curve climb above the
-   frozen model and the random-forest baseline."
-4. "The deployed FPGA logic is fixed — the **test-time training is in the
-   generator**, before deployment."
-5. "Toy block today; here's the **Qwen-2B** decomposition and the path to running
-   a real transformer block on the board."
