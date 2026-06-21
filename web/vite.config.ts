@@ -14,5 +14,13 @@ export default defineConfig({
   server: {
     host: true,
     port: 5173,
+    // Proxy chat requests to the TinyStories-1M backend
+    // (scripts/20_serve_tinystories.py), avoiding CORS.
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+    },
   },
 })
