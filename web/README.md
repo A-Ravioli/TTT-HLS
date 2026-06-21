@@ -1,6 +1,6 @@
-# Pinkdeer — Agent UI (mockup)
+# nanodeer — Agent UI (mockup)
 
-A front-end mockup for a Pinkdeer chat agent. It fuses three reference looks:
+A front-end mockup for a nanodeer chat agent. It fuses three reference looks:
 
 - **Layout** of the "chat jimmy" app (status bar, Chat/Settings panel, composer, footer).
 - **Aesthetic** of the "Hermes Agent" UI — clean **white**, big serif hero wordmark, left
@@ -25,7 +25,7 @@ Production build: `bun run build` (type-checks with `tsc -b`, then `vite build`)
 - **Fonts** — the hero wordmark uses **Kabisat Demo** (free *Italic Tall* demo variant by Mofr24,
   self-hosted at `public/fonts/`, personal-use). Its glyphs carry a `-20°` italic angle, so the
   title is counter-skewed `+20°` (`.hero-wordmark` in `src/index.css`) to read upright, and the
-  name is set in mixed case (`Pinkdeer`) so the lowercase letters break up the heavy verticals.
+  name is set in mixed case (`nanodeer`) so the lowercase letters break up the heavy verticals.
   All other text is **IBM Plex Sans**; numerals/counters use **JetBrains Mono**.
 - **Rectangular everything** — a global `*{border-radius:0 !important}` rule in `src/index.css`
   guarantees no rounded corners (Hermes style), plus `--radius*: 0` design tokens.
